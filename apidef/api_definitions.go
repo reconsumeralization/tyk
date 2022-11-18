@@ -14,8 +14,6 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/golang-jwt/jwt/v4"
-
 	uuid "github.com/satori/go.uuid"
 
 	"github.com/TykTechnologies/graphql-go-tools/pkg/engine/datasource/kafka_datasource"
@@ -622,6 +620,7 @@ type APIDefinition struct {
 	DisableRateLimit                     bool                   `bson:"disable_rate_limit" json:"disable_rate_limit"`
 	DisableQuota                         bool                   `bson:"disable_quota" json:"disable_quota"`
 	CustomMiddleware                     MiddlewareSection      `bson:"custom_middleware" json:"custom_middleware"`
+	OverwriteCustomMiddlewareBundle      bool                   `bson:"overwrite_custom_middleware_bundle" json:"overwrite_custom_middleware_bundle"`
 	CustomMiddlewareBundle               string                 `bson:"custom_middleware_bundle" json:"custom_middleware_bundle"`
 	CacheOptions                         CacheOptions           `bson:"cache_options" json:"cache_options"`
 	SessionLifetimeRespectsKeyExpiration bool                   `bson:"session_lifetime_respects_key_expiration" json:"session_lifetime_respects_key_expiration,omitempty"`
