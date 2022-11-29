@@ -9,22 +9,19 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"time"
+
+	"github.com/kelseyhightower/envconfig"
 
 	"github.com/TykTechnologies/tyk/apidef"
 	logger "github.com/TykTechnologies/tyk/log"
 	"github.com/TykTechnologies/tyk/regexp"
-	"github.com/kelseyhightower/envconfig"
 )
 
 type IPsHandleStrategy string
 
 var (
-	log      = logger.Get()
-	global   atomic.Value
-	globalMu sync.Mutex
+	log = logger.Get()
 
 	Default = Config{
 		ListenPort:     8080,
@@ -208,6 +205,9 @@ type AnalyticsConfigConfig struct {
 	PurgeInterval float32 `json:"purge_interval"`
 
 	ignoredIPsCompiled map[string]bool
+
+	// Determines the serialization engine for analytics. Available options: msgpack, and protobuf. By default, msgpack.
+	SerializerType string `json:"serializer_type"`
 }
 
 type HealthCheckConfig struct {
@@ -317,6 +317,15 @@ type SlaveOptionsConfig struct {
 
 	// You can use this to set a period for which the Gateway will check if there are changes in keys that must be synchronized. If this value is not set then it will default to 10 seconds.
 	KeySpaceSyncInterval float32 `json:"key_space_sync_interval"`
+
+	// RPCCertCacheExpiration defines the expiration time of the rpc cache that stores the certificates, defined in seconds
+	RPCCertCacheExpiration float32 `json:"rpc_cert_cache_expiration"`
+
+	// RPCKeysCacheExpiration defines the expiration time of the rpc cache that stores the keys, defined in seconds
+	RPCGlobalCacheExpiration float32 `json:"rpc_global_cache_expiration"`
+
+	// SynchroniserEnabled enable this config if MDCB has enabled the synchoniser. If disabled then it will ignore signals to synchonise recources
+	SynchroniserEnabled bool `json:"synchroniser_enabled"`
 }
 
 type LocalSessionCacheConf struct {
@@ -325,6 +334,16 @@ type LocalSessionCacheConf struct {
 
 	CachedSessionTimeout int `json:"cached_session_timeout"`
 	CacheSessionEviction int `json:"cached_session_eviction"`
+}
+type CertsData []CertData
+
+func (certs *CertsData) Decode(value string) error {
+	err := json.Unmarshal([]byte(value), certs)
+	if err != nil {
+		log.Error("Error unmarshalling TYK_GW_HTTPSERVEROPTIONS_CERTIFICATES: ", err)
+		return err
+	}
+	return nil
 }
 
 type HttpServerOptionsConfig struct {
@@ -346,6 +365,14 @@ type HttpServerOptionsConfig struct {
 	// Enable HTTP2 protocol handling
 	EnableHttp2 bool `json:"enable_http2"`
 
+	// EnableStrictRoutes changes the routing to avoid nearest-neighbour requests on overlapping routes
+	//
+	// - if disabled, `/apple` will route to `/app`, the current default behavior,
+	// - if enabled, `/app` only responds to `/app`, `/app/` and `/app/*` but not `/apple`
+	//
+	// Regular expressions and parameterized routes will be left alone regardless of this setting.
+	EnableStrictRoutes bool `json:"enable_strict_routes"`
+
 	// Disable TLS verification. Required if you are using self-signed certificates.
 	SSLInsecureSkipVerify bool `json:"ssl_insecure_skip_verify"`
 
@@ -353,7 +380,7 @@ type HttpServerOptionsConfig struct {
 	EnableWebSockets bool `json:"enable_websockets"`
 
 	// Deprecated. SSL certificates used by Gateway server.
-	Certificates []CertData `json:"certificates"`
+	Certificates CertsData `json:"certificates"`
 
 	// SSL certificates used by your Gateway server. A list of certificate IDs or path to files.
 	SSLCertificates []string `json:"ssl_certificates"`
@@ -513,6 +540,18 @@ func (r PortRange) Match(port int) bool {
 	return r.From <= port && r.To >= port
 }
 
+type PortsWhiteList map[string]PortWhiteList
+
+func (pwl *PortsWhiteList) Decode(value string) error {
+	err := json.Unmarshal([]byte(value), pwl)
+	if err != nil {
+		log.Error("Error unmarshalling TYK_GW_PORTWHITELIST: ", err)
+		return err
+	}
+
+	return nil
+}
+
 // Config is the configuration object used by Tyk to set up various parameters.
 type Config struct {
 	// OriginalPath is the path to the config file that is read. If
@@ -570,8 +609,12 @@ type Config struct {
 	// Enable Key hashing
 	HashKeys bool `json:"hash_keys"`
 
-	// Specify the Key hashing algorithm. Possible values: murmur64, murmur128, sha256
+	// Specify the Key hashing algorithm. Possible values: murmur64, murmur128, sha256.
 	HashKeyFunction string `json:"hash_key_function"`
+
+	// Specify the Key hashing algorithm for "basic auth". Possible values: murmur64, murmur128, sha256, bcrypt.
+	// Will default to "bcrypt" if not set.
+	BasicAuthHashKeyFunction string `json:"basic_auth_hash_key_function"`
 
 	// Specify your previous key hashing algorithm if you migrated from one algorithm to another.
 	HashKeyFunctionFallback []string `json:"hash_key_function_fallback"`
@@ -590,10 +633,10 @@ type Config struct {
 	// A policy can be defined in a file (Open Source installations) or from the same database as the Dashboard.
 	Policies PoliciesConfig `json:"policies"`
 
-	// Defines the ports that will be available for the API services to bind to.
+	// Defines the ports that will be available for the API services to bind to in the following format: `"{“":“”}"`. Remember to escape JSON strings.
 	// This is a map of protocol to PortWhiteList. This allows per protocol
 	// configurations.
-	PortWhiteList map[string]PortWhiteList `json:"ports_whitelist"`
+	PortWhiteList PortsWhiteList `json:"ports_whitelist"`
 
 	// Disable port whilisting, essentially allowing you to use any port for your API.
 	DisablePortWhiteList bool `json:"disable_ports_whitelist"`
@@ -922,6 +965,8 @@ type Config struct {
 
 	// Enable global API token expiration. Can be needed if all your APIs using JWT or oAuth 2.0 auth methods with dynamically generated keys.
 	ForceGlobalSessionLifetime bool `bson:"force_global_session_lifetime" json:"force_global_session_lifetime"`
+	// SessionLifetimeRespectsKeyExpiration respects the key expiration time when the session lifetime is less than the key expiration. That is, Redis waits the key expiration for physical removal.
+	SessionLifetimeRespectsKeyExpiration bool `bson:"session_lifetime_respects_key_expiration" json:"session_lifetime_respects_key_expiration"`
 	// global session lifetime, in seconds.
 	GlobalSessionLifetime int64 `bson:"global_session_lifetime" json:"global_session_lifetime"`
 
@@ -1082,6 +1127,9 @@ type TykEventHandler interface {
 	HandleEvent(EventMessage)
 }
 
+// Global function that will return the config of the gw running
+var Global func() Config
+
 func WriteConf(path string, conf *Config) error {
 	bs, err := json.MarshalIndent(conf, "", "    ")
 	if err != nil {
@@ -1117,12 +1165,13 @@ func WriteDefault(path string, conf *Config) error {
 // An error will be returned only if any of the paths existed but was
 // not a valid config file.
 func Load(paths []string, conf *Config) error {
-	var r io.Reader
-	for _, path := range paths {
-		f, err := os.Open(path)
+	var r io.ReadCloser
+	for _, filename := range paths {
+		f, err := os.Open(filename)
 		if err == nil {
 			r = f
-			conf.OriginalPath = path
+			defer r.Close()
+			conf.OriginalPath = filename
 			break
 		}
 		if os.IsNotExist(err) {
@@ -1130,6 +1179,7 @@ func Load(paths []string, conf *Config) error {
 		}
 		return err
 	}
+
 	if r == nil {
 		path := paths[0]
 		log.Warnf("No config file found, writing default to %s", path)
@@ -1139,6 +1189,7 @@ func Load(paths []string, conf *Config) error {
 		log.Info("Loading default configuration...")
 		return Load([]string{path}, conf)
 	}
+
 	if err := json.NewDecoder(r).Decode(&conf); err != nil {
 		return fmt.Errorf("couldn't unmarshal config: %v", err)
 	}
