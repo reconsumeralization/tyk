@@ -5,9 +5,6 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net/http"
-	"path/filepath"
-	"runtime"
-	"strings"
 	"time"
 
 	"github.com/TykTechnologies/tyk-pump/analytics"
@@ -120,6 +117,10 @@ func (m *GoPluginMiddleware) EnabledForSpec() bool {
 	return false
 }
 
+// loadPlugin loads the plugin file from m.Path, it will try
+//converting it to the tyk version aware format: {plugin_name}_{tyk_version}_{os}_{arch}.so
+// if the file doesn't exist then it will again but with a gw version that is not prefixed by 'v'
+// later, it will try with m.path which can be {plugin_name}.so
 func (m *GoPluginMiddleware) loadPlugin() bool {
 	m.logger = log.WithFields(logrus.Fields{
 		"mwPath":       m.Path,
@@ -134,10 +135,21 @@ func (m *GoPluginMiddleware) loadPlugin() bool {
 	// try to load plugin
 	var err error
 
-	if !FileExist(m.Path) {
-		// if the exact name doesn't exist then try to load it using tyk version
-		m.Path = m.goPluginFromTykVersion(VERSION)
+	newPath, err := goplugin.GetPluginFileNameToLoad(m.Path, VERSION)
+	if err != nil {
+		m.logger.WithError(err).Error("plugin file not found")
+		return false
 	}
+	if m.Path != newPath {
+		m.Path = newPath
+	}
+
+	defer func() {
+		if e := recover(); e != nil {
+			err = fmt.Errorf("%v", e)
+			m.logger.WithError(err).Error("Recovered from panic while loading Go-plugin")
+		}
+	}()
 
 	if m.handler, err = goplugin.GetHandler(m.Path, m.SymbolName); err != nil {
 		m.logger.WithError(err).Error("Could not load Go-plugin")
@@ -234,30 +246,4 @@ func (m *GoPluginMiddleware) ProcessRequest(w http.ResponseWriter, r *http.Reque
 	}
 
 	return
-}
-
-// goPluginFromTykVersion builds a name of plugin based on tyk version
-// os and architecture. The structure of the plugin name looks like:
-// {plugin-dir}/{plugin-name}_{GW-version}_{OS}_{arch}.so
-func (m *GoPluginMiddleware) goPluginFromTykVersion(version string) string {
-	if m.Path == "" {
-		return ""
-	}
-
-	pluginDir := filepath.Dir(m.Path)
-	// remove plugin extension to have the plugin's clean name
-	pluginName := strings.TrimSuffix(filepath.Base(m.Path), ".so")
-	os := runtime.GOOS
-	architecture := runtime.GOARCH
-
-	// sanitize away `-rc15` suffixes (remove `-*`) from version
-	vs := strings.Split(version, "-")
-	if len(vs) > 0 {
-		version = vs[0]
-	}
-
-	newPluginName := strings.Join([]string{pluginName, version, os, architecture}, "_")
-	newPluginPath := pluginDir + "/" + newPluginName + ".so"
-
-	return newPluginPath
 }

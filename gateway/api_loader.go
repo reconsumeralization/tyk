@@ -439,6 +439,10 @@ func (gw *Gateway) processSpec(spec *APISpec, apisByListen map[string]int,
 	gw.mwAppendEnabled(&chainArray, &TransformHeaders{BaseMiddleware: baseMid})
 	gw.mwAppendEnabled(&chainArray, &URLRewriteMiddleware{BaseMiddleware: baseMid})
 	gw.mwAppendEnabled(&chainArray, &TransformMethod{BaseMiddleware: baseMid})
+
+	// Earliest we can respond with cache get 200 ok
+	gw.mwAppendEnabled(&chainArray, &RedisCacheMiddleware{BaseMiddleware: baseMid, store: &cacheStore})
+
 	gw.mwAppendEnabled(&chainArray, &VirtualEndpoint{BaseMiddleware: baseMid})
 	gw.mwAppendEnabled(&chainArray, &RequestSigning{BaseMiddleware: baseMid})
 	gw.mwAppendEnabled(&chainArray, &GoPluginMiddleware{BaseMiddleware: baseMid})
@@ -461,9 +465,6 @@ func (gw *Gateway) processSpec(spec *APISpec, apisByListen map[string]int,
 			chainArray = append(chainArray, gw.createDynamicMiddleware(obj.Name, false, obj.RequireSession, baseMid))
 		}
 	}
-	//Do not add middlewares after cache middleware.
-	//It will not get executed
-	gw.mwAppendEnabled(&chainArray, &RedisCacheMiddleware{BaseMiddleware: baseMid, CacheStore: &cacheStore})
 
 	chain = alice.New(chainArray...).Then(&DummyProxyHandler{SH: SuccessHandler{baseMid}, Gw: gw})
 
@@ -907,7 +908,7 @@ func (gw *Gateway) loadApps(specs []*APISpec) {
 	for _, spec := range specs {
 		func() {
 			defer func() {
-				// recover from panic if one occured. Set err to nil otherwise.
+				// recover from panic if one occurred. Set err to nil otherwise.
 				if err := recover(); err != nil {
 					log.Errorf("Panic while loading an API: %v, panic: %v, stacktrace: %v", spec.APIDefinition, err, string(debug.Stack()))
 				}
@@ -942,6 +943,9 @@ func (gw *Gateway) loadApps(specs []*APISpec) {
 			case "tcp", "tls":
 				gw.loadTCPService(spec, &gs, muxer)
 			}
+
+			// Set versions free to update links below
+			spec.VersionDefinition.BaseID = ""
 		}()
 	}
 
@@ -953,6 +957,13 @@ func (gw *Gateway) loadApps(specs []*APISpec) {
 		curSpec, ok := gw.apisByID[spec.APIID]
 		if ok && curSpec.Checksum != spec.Checksum {
 			curSpec.Release()
+		}
+
+		// Bind versions to base APIs again
+		for _, vID := range spec.VersionDefinition.Versions {
+			if versionAPI, ok := tmpSpecRegister[vID]; ok {
+				versionAPI.VersionDefinition.BaseID = spec.APIID
+			}
 		}
 	}
 

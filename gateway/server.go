@@ -480,14 +480,12 @@ func (gw *Gateway) syncAPISpecs() (int, error) {
 		}
 	}
 	var filter []*APISpec
-	var tmpCheckSum = make(map[string]struct{})
 	for _, v := range s {
 		if err := v.Validate(); err != nil {
 			mainLog.WithError(err).WithField("spec", v.Name).Error("Skipping loading spec because it failed validation")
 			continue
 		}
 		filter = append(filter, v)
-		tmpCheckSum[v.Checksum] = struct{}{}
 	}
 
 	gw.apisMu.Lock()
@@ -835,10 +833,15 @@ func (gw *Gateway) loadCustomMiddleware(spec *APISpec) ([]string, apidef.Middlew
 
 }
 
+// Create the response processor chain
 func (gw *Gateway) createResponseMiddlewareChain(spec *APISpec, responseFuncs []apidef.MiddlewareDefinition) {
-	// Create the response processors
+	// Prealloc size
+	chainLen := len(spec.ResponseProcessors)
+	// Append capacity
+	chainCapacity := chainLen + 1 + len(responseFuncs)
 
-	responseChain := make([]TykResponseHandler, len(spec.ResponseProcessors))
+	responseChain := make([]TykResponseHandler, chainLen, chainCapacity)
+
 	for i, processorDetail := range spec.ResponseProcessors {
 		processor := gw.responseProcessorByName(processorDetail.Name)
 		if processor == nil {
@@ -868,10 +871,22 @@ func (gw *Gateway) createResponseMiddlewareChain(spec *APISpec, responseFuncs []
 		}
 
 		if err := processor.Init(mw, spec); err != nil {
-			mainLog.Debug("Failed to init processor: ", err)
+			mainLog.WithError(err).Debug("Failed to init processor")
 		}
 		responseChain = append(responseChain, processor)
 	}
+
+	keyPrefix := "cache-" + spec.APIID
+	cacheStore := &storage.RedisCluster{KeyPrefix: keyPrefix, IsCache: true, RedisController: gw.RedisController}
+	cacheStore.Connect()
+
+	// Add cache writer as the final step of the response middleware chain
+	processor := &ResponseCacheMiddleware{store: cacheStore}
+	if err := processor.Init(nil, spec); err != nil {
+		mainLog.WithError(err).Debug("Failed to init processor")
+	}
+
+	responseChain = append(responseChain, processor)
 
 	spec.ResponseChain = responseChain
 }
@@ -1043,9 +1058,8 @@ func (gw *Gateway) setupLogger() {
 
 		hook, err := logrus_sentry.NewSentryHook(gwConfig.SentryCode, logLevel)
 
-		hook.Timeout = 0
-
 		if err == nil {
+			hook.Timeout = 0
 			log.Hooks.Add(hook)
 			rawLog.Hooks.Add(hook)
 		}
