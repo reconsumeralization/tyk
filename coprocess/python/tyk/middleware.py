@@ -21,7 +21,7 @@ class TykMiddleware:
         self.bundle_root_path = bundle_root_path
 
         self.imported_modules = []
-        
+
         self.middleware_id = filepath
 
         self.module_path = os.path.join(self.bundle_root_path, filepath)
@@ -42,7 +42,6 @@ class TykMiddleware:
             self.cleanup()
         except Exception as e:
             tyk.log_error("Middleware initialization error: {0}".format(e))
-            pass
 
     def register_handlers(self):
         new_handlers = {}

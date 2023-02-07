@@ -15,7 +15,4 @@ class TykCoProcessRequest():
         self.object.delete_params.append(key)
 
     def get_header(self, key):
-        if key in self.object.headers:
-            return self.object.headers[key]
-        else:
-            return None
+        return self.object.headers[key] if key in self.object.headers else None

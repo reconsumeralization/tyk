@@ -5,7 +5,6 @@ import sys
 from gateway import TykGateway as tyk
 def except_hook(type, value, traceback):
     tyk.log_error("{0}".format(value))
-    pass
 
 sys.excepthook = except_hook
 
@@ -27,12 +26,10 @@ class TykDispatcher:
         self.hook_table = {}
 
     def find_bundle(self, bundle_id):
-        found = None
-        for bundle in self.bundles:
-            if bundle.bundle_id == bundle_id:
-                found = bundle
-                break
-        return found
+        return next(
+            (bundle for bundle in self.bundles if bundle.bundle_id == bundle_id),
+            None,
+        )
 
     def load_bundle(self, bundle_path):
         path_splits = bundle_path.split('/')
@@ -53,8 +50,7 @@ class TykDispatcher:
         if not hooks:
             raise Exception('No hooks defined for bundle: {0}'.format(bundle_hash))
 
-        hook = hooks.get(hook_name)
-        if hook:
+        if hook := hooks.get(hook_name):
             return hook.middleware, hook
         else:
             raise Exception('Hook is not defined: {0}'.format(hook_name))
@@ -80,4 +76,3 @@ class TykDispatcher:
 
     def reload(self):
         tyk.log("Reloading event handlers and middlewares.", "info")
-        pass
