@@ -30,8 +30,7 @@ require (
 	github.com/go-redis/redis/v8 v8.11.5
 	github.com/gocraft/health v0.0.0-20170925182251-8675af27fef0
 	github.com/golang-jwt/jwt/v4 v4.4.2
-	github.com/golang/protobuf v1.5.2
-	github.com/google/uuid v1.3.0 // indirect
+	github.com/golang/protobuf v1.5.3
 	github.com/gorilla/mux v1.8.0
 	github.com/gorilla/websocket v1.5.0
 	github.com/hashicorp/consul/api v1.3.0
@@ -60,16 +59,16 @@ require (
 	github.com/rs/cors v1.7.0
 	github.com/satori/go.uuid v1.2.0
 	github.com/sirupsen/logrus v1.8.1
-	github.com/spf13/afero v1.6.0
+	github.com/spf13/afero v1.9.2
 	github.com/square/go-jose v2.4.1+incompatible
 	github.com/uber/jaeger-client-go v2.20.0+incompatible
 	github.com/vmihailenco/msgpack v4.0.4+incompatible
 	github.com/x-cray/logrus-prefixed-formatter v0.5.2
 	github.com/xeipuuv/gojsonschema v1.2.0
 	golang.org/x/crypto v0.0.0-20220513210258-46612604a0f9
-	golang.org/x/net v0.0.0-20220906165146-f3363e06e74c
-	golang.org/x/sync v0.0.0-20220722155255-886fb9371eb4
-	google.golang.org/grpc v1.36.0
+	golang.org/x/net v0.9.0
+	golang.org/x/sync v0.1.0
+	google.golang.org/grpc v1.56.3
 	gopkg.in/alecthomas/kingpin.v2 v2.2.6
 	gopkg.in/mgo.v2 v2.0.0-20190816093944-a6b53ec6cb22
 	gopkg.in/vmihailenco/msgpack.v2 v2.9.1
@@ -81,7 +80,7 @@ require (
 require (
 	github.com/lonelycode/go-uuid v0.0.0-20141202165402-ed3ca8a15a93 // test
 	github.com/nsf/jsondiff v0.0.0-20210303162244-6ea32392771e // test
-	github.com/stretchr/testify v1.7.1 // test
+	github.com/stretchr/testify v1.8.3 // test
 	github.com/valyala/fasthttp v1.43.0 // test
 	google.golang.org/grpc/examples v0.0.0-20220317213542-f95b001a48df // test
 )
