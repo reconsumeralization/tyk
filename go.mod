@@ -48,7 +48,7 @@ require (
 	github.com/miekg/dns v1.0.14
 	github.com/mitchellh/copystructure v1.2.0 // indirect
 	github.com/mitchellh/mapstructure v1.4.1
-	github.com/nats-io/nats-server/v2 v2.3.4 // indirect
+	github.com/nats-io/nats-server/v2 v2.9.23 // indirect
 	github.com/newrelic/go-agent v2.13.0+incompatible
 	github.com/opentracing/opentracing-go v1.2.0
 	github.com/openzipkin/zipkin-go v0.2.2
@@ -66,9 +66,9 @@ require (
 	github.com/vmihailenco/msgpack v4.0.4+incompatible
 	github.com/x-cray/logrus-prefixed-formatter v0.5.2
 	github.com/xeipuuv/gojsonschema v1.2.0
-	golang.org/x/crypto v0.0.0-20220513210258-46612604a0f9
-	golang.org/x/net v0.0.0-20220906165146-f3363e06e74c
-	golang.org/x/sync v0.0.0-20220722155255-886fb9371eb4
+	golang.org/x/crypto v0.12.0
+	golang.org/x/net v0.10.0
+	golang.org/x/sync v0.1.0
 	google.golang.org/grpc v1.36.0
 	gopkg.in/alecthomas/kingpin.v2 v2.2.6
 	gopkg.in/mgo.v2 v2.0.0-20190816093944-a6b53ec6cb22
