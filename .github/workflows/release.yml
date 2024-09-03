@@ -189,7 +189,7 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v1
 
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v4.1.7
         with:
           name: deb
 
@@ -257,7 +257,7 @@ jobs:
         with:
           fetch-depth: 1
 
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v4.1.7
         with:
           name: deb
 
@@ -310,7 +310,7 @@ jobs:
         with:
           fetch-depth: 1
 
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v4.1.7
         with:
           name: rpm
 
@@ -405,7 +405,7 @@ jobs:
         with:
           fetch-depth: 1
 
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v4.1.7
         with:
           name: rpm
           path: aws
