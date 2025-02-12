@@ -2,30 +2,101 @@ package gateway
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"regexp"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/TykTechnologies/tyk/config"
-
+	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 
-	"github.com/TykTechnologies/tyk/ctx"
-	"github.com/TykTechnologies/tyk/user"
-
-	"github.com/sirupsen/logrus"
-	prefixed "github.com/x-cray/logrus-prefixed-formatter"
-
 	"github.com/TykTechnologies/tyk/apidef"
+	"github.com/TykTechnologies/tyk/config"
+	"github.com/TykTechnologies/tyk/ctx"
 	logger "github.com/TykTechnologies/tyk/log"
+	"github.com/TykTechnologies/tyk/regexp"
 	"github.com/TykTechnologies/tyk/test"
+	"github.com/TykTechnologies/tyk/user"
 )
+
+func TestJSVM_StopProxyWhenFail(t *testing.T) {
+	ts := StartTest(nil)
+	defer ts.Close()
+
+	const apiID = "my-api-id"
+
+	api := BuildAPI(func(spec *APISpec) {
+		spec.APIID = apiID
+		spec.Proxy.ListenPath = "/"
+		spec.CustomMiddleware.Driver = apidef.OttoDriver
+		spec.CustomMiddleware.Pre = []apidef.MiddlewareDefinition{
+			{
+				Name: "nonExistingMiddleware",
+				Path: "non-existing.js",
+			},
+		}
+	})[0]
+
+	t.Run("not loaded", func(t *testing.T) {
+		ts.Gw.LoadAPI(api)
+		_, _ = ts.Run(t, test.TestCase{
+			Path: "/get", Code: http.StatusInternalServerError, BodyMatch: http.StatusText(http.StatusInternalServerError),
+		})
+	})
+
+	t.Run("failed to decode returned data", func(t *testing.T) {
+		var malformedDataJS = `
+var malformedDataMiddleware = new TykJS.TykMiddleware.NewMiddleware({});
+malformedDataMiddleware.NewProcessRequest(function(request, session) {
+	return {Request:request, Session:"malformed"}
+});`
+
+		ts.RegisterJSFileMiddleware(apiID, map[string]string{
+			"malformedData.js": malformedDataJS,
+		})
+
+		api.CustomMiddleware.Pre[0].Name = "malformedDataMiddleware"
+		api.CustomMiddleware.Pre[0].Path = ts.Gw.GetConfig().MiddlewarePath + "/my-api-id/malformedData.js"
+		ts.Gw.LoadAPI(api)
+
+		_, _ = ts.Run(t, test.TestCase{
+			Path: "/get", Code: http.StatusInternalServerError, BodyMatch: http.StatusText(http.StatusInternalServerError),
+		})
+	})
+
+	t.Run("middleware timed out", func(t *testing.T) {
+		var timeoutJS = `
+var timeoutMiddleware = new TykJS.TykMiddleware.NewMiddleware({});
+timeoutMiddleware.NewProcessRequest(function(request, session) {
+		while(true) {}  // infinite loop to timeout
+	return timeoutMiddleware.ReturnData(request, {})
+});`
+
+		ts.RegisterJSFileMiddleware(apiID, map[string]string{
+			"timeout.js": timeoutJS,
+		})
+
+		// set timeout to a small value
+		gwConfig := ts.Gw.GetConfig()
+		gwConfig.JSVMTimeout = 1
+		ts.Gw.SetConfig(gwConfig)
+		ts.Gw.GlobalEventsJSVM.DeInit()
+		ts.Gw.GlobalEventsJSVM.Init(nil, logrus.NewEntry(log), ts.Gw)
+
+		api.CustomMiddleware.Pre[0].Name = "timeoutMiddleware"
+		api.CustomMiddleware.Pre[0].Path = ts.Gw.GetConfig().MiddlewarePath + "/my-api-id/timeout.js"
+		ts.Gw.LoadAPI(api)
+
+		_, _ = ts.Run(t, test.TestCase{
+			Path: "/get", Code: http.StatusInternalServerError, BodyMatch: http.StatusText(http.StatusInternalServerError),
+		})
+	})
+}
 
 func TestJSVMLogs(t *testing.T) {
 	ts := StartTest(nil)
@@ -34,7 +105,6 @@ func TestJSVMLogs(t *testing.T) {
 	var buf bytes.Buffer
 	log := logrus.New()
 	log.Out = &buf
-	log.Formatter = new(prefixed.TextFormatter)
 
 	jsvm := JSVM{}
 	jsvm.Init(nil, logrus.NewEntry(log), ts.Gw)
@@ -52,7 +122,7 @@ rawlog('{"x": "y"}')
 
 	want := []string{
 		`time=TIME level=info msg=foo prefix=jsvm type=log-msg`,
-		`time=TIME level=info msg="{"x": "y"}" prefix=jsvm type=log-msg`,
+		`time=TIME level=info msg="{\"x\": \"y\"}" prefix=jsvm type=log-msg`,
 		`foo`,
 		`{"x": "y"}`,
 	}
@@ -85,7 +155,7 @@ func TestJSVMBody(t *testing.T) {
 	defer ts.Close()
 
 	dynMid := &DynamicMiddleware{
-		BaseMiddleware: BaseMiddleware{
+		BaseMiddleware: &BaseMiddleware{
 			Spec: &APISpec{APIDefinition: &apidef.APIDefinition{}},
 			Gw:   ts.Gw,
 		},
@@ -126,7 +196,7 @@ func TestJSVMSessionMetadataUpdate(t *testing.T) {
 	defer ts.Close()
 
 	dynMid := &DynamicMiddleware{
-		BaseMiddleware: BaseMiddleware{
+		BaseMiddleware: &BaseMiddleware{
 			Spec: &APISpec{APIDefinition: &apidef.APIDefinition{}},
 			Gw:   ts.Gw,
 		},
@@ -172,12 +242,99 @@ testJSVMMiddleware.NewProcessRequest(function(request, session) {
 	}
 }
 
+func TestJSVM_MultiAuthentication(t *testing.T) {
+	ts := StartTest(nil)
+	defer ts.Close()
+
+	const (
+		apiID          = "my-api-id"
+		sessionMetaKey = "sessionMetaKey"
+
+		customAuthSessionMetaValue = "customAuthSessionMetaValue"
+		customAuthSessionID        = "customAuthSessionID"
+		customAuthSessionRate      = 100
+
+		authTokenSessionMetaValue = "authTokenSessionMetaValue"
+		authTokenSessionRate      = 200
+	)
+
+	var js = fmt.Sprintf(`
+var testJSVMMiddleware = new TykJS.TykMiddleware.NewMiddleware({});
+
+testJSVMMiddleware.NewProcessRequest(function(request, session) {
+		var thisSession = {
+			"rate": %d,
+			"per": 1,
+			"quota_max": -1,	
+			"access_rights": {},
+			"meta_data": {"%s": "%s"}
+		};
+
+	return {Request:request, Session:thisSession, AuthValue:"%s"}
+});`, customAuthSessionRate, sessionMetaKey, customAuthSessionMetaValue, customAuthSessionID)
+
+	ts.RegisterJSFileMiddleware(apiID, map[string]string{
+		"auth.js": js,
+	})
+
+	api := BuildAPI(func(spec *APISpec) {
+		spec.APIID = apiID
+		spec.Proxy.ListenPath = "/"
+		spec.UseKeylessAccess = false
+		spec.EnableCoProcessAuth = true
+		spec.CustomMiddleware.Driver = apidef.OttoDriver
+		spec.CustomMiddleware.AuthCheck.Name = "testJSVMMiddleware"
+		spec.CustomMiddleware.AuthCheck.Path = ts.Gw.GetConfig().MiddlewarePath + "/my-api-id/auth.js"
+		spec.UseStandardAuth = true
+		spec.BaseIdentityProvidedBy = apidef.AuthToken
+		spec.VersionData.Versions["v1"] = apidef.VersionInfo{
+			GlobalResponseHeaders: map[string]string{
+				sessionMetaKey: "$tyk_meta." + sessionMetaKey,
+			},
+		}
+	})[0]
+
+	_, authTokenSessionID := ts.CreateSession(func(s *user.SessionState) {
+		s.Rate = authTokenSessionRate
+		s.MetaData = map[string]interface{}{
+			sessionMetaKey: authTokenSessionMetaValue,
+		}
+		s.AccessRights = map[string]user.AccessDefinition{apiID: {
+			APIID: apiID, Versions: []string{"v1"},
+		}}
+	})
+
+	check := func(t *testing.T, baseIdentityProvidedBy apidef.AuthTypeEnum, keyName string, headerVal string, rate int) {
+		t.Helper()
+
+		api.BaseIdentityProvidedBy = baseIdentityProvidedBy
+		ts.Gw.LoadAPI(api)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Headers: map[string]string{"Authorization": authTokenSessionID},
+				HeadersMatch: map[string]string{sessionMetaKey: headerVal}, Code: http.StatusOK},
+		}...)
+
+		retSession, found := ts.Gw.GlobalSessionManager.SessionDetail(api.OrgID, keyName, false)
+		assert.Equal(t, float64(rate), retSession.Rate)
+		assert.True(t, found)
+	}
+
+	t.Run("custom base identity", func(t *testing.T) {
+		check(t, apidef.CustomAuth, customAuthSessionID, customAuthSessionMetaValue, customAuthSessionRate)
+	})
+
+	t.Run("auth token base identity", func(t *testing.T) {
+		check(t, apidef.AuthToken, authTokenSessionID, authTokenSessionMetaValue, authTokenSessionRate)
+	})
+}
+
 func TestJSVMProcessTimeout(t *testing.T) {
 	ts := StartTest(nil)
 	defer ts.Close()
 
 	dynMid := &DynamicMiddleware{
-		BaseMiddleware: BaseMiddleware{
+		BaseMiddleware: &BaseMiddleware{
 			Spec: &APISpec{APIDefinition: &apidef.APIDefinition{}},
 			Gw:   ts.Gw,
 		},
@@ -219,35 +376,60 @@ leakMid.NewProcessRequest(function(request, session) {
 func TestJSVMConfigData(t *testing.T) {
 	ts := StartTest(nil)
 	defer ts.Close()
-
-	spec := &APISpec{APIDefinition: &apidef.APIDefinition{}}
-	spec.ConfigData = map[string]interface{}{
-		"foo": "bar",
-	}
 	const js = `
-var testJSVMData = new TykJS.TykMiddleware.NewMiddleware({})
+		var testJSVMData = new TykJS.TykMiddleware.NewMiddleware({})
+		
+		testJSVMData.NewProcessRequest(function(request, session, spec) {
+			request.SetHeaders["data-foo"] = spec.config_data.foo
+			return testJSVMData.ReturnData(request, {})
+		});`
 
-testJSVMData.NewProcessRequest(function(request, session, spec) {
-	request.SetHeaders["data-foo"] = spec.config_data.foo
-	return testJSVMData.ReturnData(request, {})
-});`
-	dynMid := &DynamicMiddleware{
-		BaseMiddleware:      BaseMiddleware{Spec: spec, Proxy: nil, Gw: ts.Gw},
-		MiddlewareClassName: "testJSVMData",
-		Pre:                 true,
-	}
-	jsvm := JSVM{}
-	jsvm.Init(nil, logrus.NewEntry(log), ts.Gw)
-	if _, err := jsvm.VM.Run(js); err != nil {
-		t.Fatalf("failed to set up js plugin: %v", err)
-	}
-	dynMid.Spec.JSVM = jsvm
+	t.Run("config data enabled", func(t *testing.T) {
+		spec := &APISpec{APIDefinition: &apidef.APIDefinition{}}
+		spec.ConfigData = map[string]interface{}{
+			"foo": "bar",
+		}
+		dynMid := &DynamicMiddleware{
+			BaseMiddleware:      &BaseMiddleware{Spec: spec, Proxy: nil, Gw: ts.Gw},
+			MiddlewareClassName: "testJSVMData",
+			Pre:                 true,
+		}
+		jsvm := JSVM{}
+		jsvm.Init(nil, logrus.NewEntry(log), ts.Gw)
+		if _, err := jsvm.VM.Run(js); err != nil {
+			t.Fatalf("failed to set up js plugin: %v", err)
+		}
+		dynMid.Spec.JSVM = jsvm
 
-	r := TestReq(t, "GET", "/v1/test-data", nil)
-	dynMid.ProcessRequest(nil, r, nil)
-	if want, got := "bar", r.Header.Get("data-foo"); want != got {
-		t.Fatalf("wanted header to be %q, got %q", want, got)
-	}
+		r := TestReq(t, "GET", "/v1/test-data", nil)
+		_, _ = dynMid.ProcessRequest(nil, r, nil)
+		assert.Equal(t, "bar", r.Header.Get("data-foo"))
+	})
+
+	t.Run("config data disabled", func(t *testing.T) {
+		spec := &APISpec{APIDefinition: &apidef.APIDefinition{}}
+		spec.ConfigData = map[string]interface{}{
+			"foo": "bar",
+		}
+		spec.ConfigDataDisabled = true
+
+		dynMid := &DynamicMiddleware{
+			BaseMiddleware:      &BaseMiddleware{Spec: spec, Proxy: nil, Gw: ts.Gw},
+			MiddlewareClassName: "testJSVMData",
+			Pre:                 true,
+		}
+		jsvm := JSVM{}
+		jsvm.Init(nil, logrus.NewEntry(log), ts.Gw)
+		if _, err := jsvm.VM.Run(js); err != nil {
+			t.Fatalf("failed to set up js plugin: %v", err)
+		}
+		dynMid.Spec.JSVM = jsvm
+
+		r := TestReq(t, "GET", "/v1/test-data", nil)
+		_, _ = dynMid.ProcessRequest(nil, r, nil)
+		assert.Empty(t, r.Header.Get("data-foo"))
+	})
+
 }
 func TestJSVM_IgnoreCanonicalHeader(t *testing.T) {
 	ts := StartTest(nil)
@@ -262,7 +444,7 @@ testJSVMData.NewProcessRequest(function(request, session, spec) {
 	return testJSVMData.ReturnData(request, {})
 });`
 	dynMid := &DynamicMiddleware{
-		BaseMiddleware:      BaseMiddleware{Spec: spec, Proxy: nil, Gw: ts.Gw},
+		BaseMiddleware:      &BaseMiddleware{Spec: spec, Proxy: nil, Gw: ts.Gw},
 		MiddlewareClassName: "testJSVMData",
 		Pre:                 true,
 	}
@@ -306,7 +488,7 @@ testJSVMCore.NewProcessRequest(function(request, session, config) {
 	return testJSVMCore.ReturnData(request, {})
 });`
 	dynMid := &DynamicMiddleware{
-		BaseMiddleware:      BaseMiddleware{Spec: spec, Proxy: nil, Gw: ts.Gw},
+		BaseMiddleware:      &BaseMiddleware{Spec: spec, Proxy: nil, Gw: ts.Gw},
 		MiddlewareClassName: "testJSVMCore",
 		Pre:                 true,
 	}
@@ -345,7 +527,7 @@ func TestJSVMRequestScheme(t *testing.T) {
 	defer ts.Close()
 
 	dynMid := &DynamicMiddleware{
-		BaseMiddleware: BaseMiddleware{
+		BaseMiddleware: &BaseMiddleware{
 			Spec: &APISpec{APIDefinition: &apidef.APIDefinition{}},
 			Gw:   ts.Gw,
 		},
@@ -395,7 +577,8 @@ func TestTykMakeHTTPRequest(t *testing.T) {
 		            "name": "testTykMakeHTTPRequest",
 		            "path": "middleware.js"
 		        }]
-		    }
+		    },
+			"checksum": "d41d8cd98f00b204e9800998ecf8427e"
 		}
 	`,
 		"middleware.js": `
@@ -613,7 +796,8 @@ post.NewProcessRequest(function(request, session) {
 		            "name": "post",
 		            "path": "post.js"
 		        }]
-		    }
+		    },
+			"checksum": "d41d8cd98f00b204e9800998ecf8427e"
 		}
 	`,
 			"pre.js":  pre,
@@ -720,7 +904,19 @@ func TestMiniRequestObject_ReconstructParams(t *testing.T) {
 }
 
 func TestJSVM_Auth(t *testing.T) {
-	ts := StartTest(nil)
+	for _, hashKeys := range []bool{true, false} {
+		t.Run(fmt.Sprintf("hashKeys=%v", hashKeys), func(t *testing.T) {
+			testJSVM_Auth(t, hashKeys)
+		})
+	}
+}
+
+func testJSVM_Auth(t *testing.T, hashKeys bool) {
+	t.Helper()
+
+	ts := StartTest(func(c *config.Config) {
+		c.HashKeys = hashKeys
+	})
 	defer ts.Close()
 
 	bundle := ts.RegisterBundle("custom_auth", map[string]string{
@@ -745,7 +941,7 @@ func TestJSVM_Auth(t *testing.T) {
 					"extractor_config": null
 				}
 			},
-			"checksum": "65694908d609b14df0e280c1a95a8ca4",
+			"checksum": "9529d0f95290c7026dd8049b981ec7b1",
 			"signature": ""
 		}`,
 		"testmw.js": `log("====> JS Auth initialising");
@@ -807,30 +1003,49 @@ func TestJSVM_Auth(t *testing.T) {
 		spec.UseKeylessAccess = false
 	})
 	_, _ = ts.Run(t, []test.TestCase{
-		{Path: "/sample", Code: http.StatusUnauthorized, BodyMatchFunc: func(b []byte) bool {
-			return strings.Contains(string(b), "Header missing (JS middleware)")
+		{
+			Path: "/sample",
+			Code: http.StatusUnauthorized,
+			BodyMatchFunc: func(b []byte) bool {
+				return strings.Contains(string(b), "Header missing (JS middleware)")
+			},
 		},
-		},
-		{Path: "/sample", Code: http.StatusUnauthorized, BodyMatchFunc: func(b []byte) bool {
-			return strings.Contains(string(b), "Not authorized (JS middleware)")
-		},
+		{
+			Path: "/sample",
+			Code: http.StatusUnauthorized,
+			BodyMatchFunc: func(b []byte) bool {
+				return strings.Contains(string(b), "Not authorized (JS middleware)")
+			},
 			Headers: map[string]string{"Authorization": "foo"},
 		},
-		{Path: "/sample", Code: http.StatusOK, Headers: map[string]string{
-			"Authorization": "foobar",
-		}},
-
-		{Path: "/sample-with-customplugin-auth-enabled", Code: http.StatusUnauthorized, BodyMatchFunc: func(b []byte) bool {
-			return strings.Contains(string(b), "Header missing (JS middleware)")
+		{
+			Path: "/sample",
+			Code: http.StatusOK,
+			Headers: map[string]string{
+				"Authorization": "foobar",
+			},
 		},
+		{
+			Path: "/sample-with-customplugin-auth-enabled",
+			Code: http.StatusUnauthorized,
+			BodyMatchFunc: func(b []byte) bool {
+				return strings.Contains(string(b), "Header missing (JS middleware)")
+			},
 		},
-		{Path: "/sample-with-customplugin-auth-enabled", Code: http.StatusUnauthorized, BodyMatchFunc: func(b []byte) bool {
-			return strings.Contains(string(b), "Not authorized (JS middleware)")
-		},
+		{
+			Path: "/sample-with-customplugin-auth-enabled",
+			Code: http.StatusUnauthorized,
+			BodyMatchFunc: func(b []byte) bool {
+				return strings.Contains(string(b), "Not authorized (JS middleware)")
+			},
 			Headers: map[string]string{"Authorization": "foo"},
 		},
-		{Path: "/sample-with-customplugin-auth-enabled", Code: http.StatusOK, Headers: map[string]string{
-			"Authorization": "foobar",
-		}},
+		{
+			Path: "/sample-with-customplugin-auth-enabled",
+			Code: http.StatusOK,
+			Headers: map[string]string{
+				"Authorization": "foobar",
+			},
+		},
 	}...)
 }

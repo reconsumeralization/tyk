@@ -6,9 +6,9 @@ import (
 	"strings"
 	"time"
 
-	uuid "github.com/satori/go.uuid"
 	"github.com/sirupsen/logrus"
 
+	"github.com/TykTechnologies/tyk/internal/uuid"
 	"github.com/TykTechnologies/tyk/storage"
 	"github.com/TykTechnologies/tyk/user"
 )
@@ -33,6 +33,13 @@ type DefaultSessionManager struct {
 	Gw    *Gateway `json:"-"`
 }
 
+func (b *DefaultSessionManager) ResetQuotaObfuscateKey(keyName string) string {
+	if !b.Gw.GetConfig().HashKeys && !b.Gw.GetConfig().EnableKeyLogging {
+		return b.Gw.obfuscateKey(keyName)
+	}
+	return keyName
+}
+
 func (b *DefaultSessionManager) Init(store storage.Handler) {
 	b.store = store
 	b.store.Connect()
@@ -52,6 +59,7 @@ func (b *DefaultSessionManager) Store() storage.Handler {
 
 func (b *DefaultSessionManager) ResetQuota(keyName string, session *user.SessionState, isHashed bool) {
 	origKeyName := keyName
+
 	if !isHashed {
 		keyName = storage.HashKey(keyName, b.Gw.GetConfig().HashKeys)
 	}
@@ -60,19 +68,39 @@ func (b *DefaultSessionManager) ResetQuota(keyName string, session *user.Session
 	log.WithFields(logrus.Fields{
 		"prefix":      "auth-mgr",
 		"inbound-key": b.Gw.obfuscateKey(origKeyName),
-		"key":         rawKey,
+		"key":         b.ResetQuotaObfuscateKey(keyName),
 	}).Info("Reset quota for key.")
 
 	rateLimiterSentinelKey := RateLimitKeyPrefix + keyName + ".BLOCKED"
 
-	// Clear the rate limiter
-	b.store.DeleteRawKey(rateLimiterSentinelKey)
+	// Clear the rate limiter and
 	// Fix the raw key
-	b.store.DeleteRawKey(rawKey)
+	defaultKeys := []string{rateLimiterSentinelKey, rawKey}
+	keys := rawKeysWithAllowanceScope(defaultKeys, keyName, session)
+	b.store.DeleteRawKeys(keys)
+}
+
+func rawKeysWithAllowanceScope(keys []string, keyName string, session *user.SessionState) []string {
+	for _, acl := range session.AccessRights {
+		if acl.AllowanceScope == "" {
+			continue
+		}
+		keys = append(keys, QuotaKeyPrefix+acl.AllowanceScope+"-"+keyName)
+	}
+	return keys
+}
+
+func (b *DefaultSessionManager) deleteRawKeysWithAllowanceScope(store storage.Handler, session *user.SessionState, keyName string) {
+	if store == nil || session == nil {
+		return
+	}
 
 	for _, acl := range session.AccessRights {
-		rawKey = QuotaKeyPrefix + acl.AllowanceScope + "-" + keyName
-		b.store.DeleteRawKey(rawKey)
+		if acl.AllowanceScope == "" {
+			continue
+		}
+		rawKey := QuotaKeyPrefix + acl.AllowanceScope + "-" + keyName
+		store.DeleteRawKey(rawKey)
 	}
 }
 
@@ -81,7 +109,6 @@ func (b *DefaultSessionManager) clearCacheForKey(keyName string, hashed bool) {
 	if !hashed {
 		cacheKey = storage.HashKey(keyName, b.Gw.GetConfig().HashKeys)
 	}
-
 	// Delete gateway's cache immediately
 	b.Gw.SessionCache.Delete(cacheKey)
 
@@ -142,15 +169,21 @@ func (b *DefaultSessionManager) SessionDetail(orgID string, keyName string, hash
 	} else {
 		if storage.TokenOrg(keyName) != orgID {
 			// try to get legacy and new format key at once
-			toSearchList := []string{b.Gw.generateToken(orgID, keyName), keyName}
+			toSearchList := []string{}
+			if !b.Gw.GetConfig().DisableKeyActionsByUsername {
+				toSearchList = append(toSearchList, b.Gw.generateToken(orgID, keyName))
+			}
+
+			toSearchList = append(toSearchList, keyName)
 			for _, fallback := range b.Gw.GetConfig().HashKeyFunctionFallback {
-				toSearchList = append(toSearchList, b.Gw.generateToken(orgID, keyName, fallback))
+				if !b.Gw.GetConfig().DisableKeyActionsByUsername {
+					toSearchList = append(toSearchList, b.Gw.generateToken(orgID, keyName, fallback))
+				}
 			}
 
 			var jsonKeyValList []string
 
 			jsonKeyValList, err = b.store.GetMultiKey(toSearchList)
-
 			// pick the 1st non empty from the returned list
 			for idx, val := range jsonKeyValList {
 				if val != "" {
@@ -219,7 +252,5 @@ func (d DefaultKeyGenerator) GenerateAuthKey(orgID string) string {
 
 // GenerateHMACSecret is a utility function for generating new auth keys. Returns the storage key name and the actual key
 func (DefaultKeyGenerator) GenerateHMACSecret() string {
-	u5 := uuid.NewV4()
-	cleanSting := strings.Replace(u5.String(), "-", "", -1)
-	return base64.StdEncoding.EncodeToString([]byte(cleanSting))
+	return base64.StdEncoding.EncodeToString([]byte(uuid.NewHex()))
 }

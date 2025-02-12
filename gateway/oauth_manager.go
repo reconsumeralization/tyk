@@ -10,15 +10,17 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/sirupsen/logrus"
-
-	"github.com/TykTechnologies/tyk/request"
-
+	"github.com/hashicorp/go-multierror"
 	"github.com/lonelycode/osin"
-	uuid "github.com/satori/go.uuid"
+	"github.com/sirupsen/logrus"
 	"golang.org/x/crypto/bcrypt"
+
+	internalerrors "github.com/TykTechnologies/tyk/internal/errors"
+	"github.com/TykTechnologies/tyk/internal/uuid"
+	"github.com/TykTechnologies/tyk/request"
 
 	"strconv"
 
@@ -338,6 +340,10 @@ type OAuthManager struct {
 	API        *APISpec
 	OsinServer *TykOsinServer
 	Gw         *Gateway `json:"-"`
+}
+
+func (o *OAuthManager) Storage() ExtendedOsinStorageInterface {
+	return o.OsinServer.Storage
 }
 
 // HandleAuthorisation creates the authorisation data for the request
@@ -1004,8 +1010,10 @@ func (r *RedisOsinStorageInterface) SaveAccess(accessData *osin.AccessData) erro
 		}
 	}
 
+	sessionLifetime := r.Gw.ApplyLifetime(newSession)
+
 	// Use the default session expiry here as this is OAuth
-	r.sessionManager.UpdateSession(accessData.AccessToken, newSession, int64(accessData.ExpiresIn), false)
+	r.sessionManager.UpdateSession(accessData.AccessToken, newSession, sessionLifetime, false)
 
 	// Store the refresh token too
 	if accessData.RefreshToken != "" {
@@ -1138,8 +1146,7 @@ func (a accessTokenGen) GenerateAccessToken(data *osin.AccessData, generaterefre
 
 	accesstoken = a.Gw.keyGen.GenerateAuthKey(newSession.OrgID)
 	if generaterefresh {
-		u6 := uuid.NewV4()
-		refreshtoken = base64.StdEncoding.EncodeToString([]byte(u6.String()))
+		refreshtoken = base64.StdEncoding.EncodeToString([]byte(uuid.New()))
 	}
 	return
 }
@@ -1180,4 +1187,62 @@ func (r *RedisOsinStorageInterface) SetUser(username string, session *user.Sessi
 
 	return nil
 
+}
+
+func (gw *Gateway) purgeLapsedOAuthTokens() error {
+	if gw.GetConfig().OauthTokenExpiredRetainPeriod <= 0 {
+		return nil
+	}
+
+	redisCluster := &storage.RedisCluster{KeyPrefix: "", HashKeys: false, ConnectionHandler: gw.StorageConnectionHandler}
+	redisCluster.Connect()
+
+	ok, err := redisCluster.Lock("oauth-purge-lock", time.Minute)
+	if err != nil {
+		log.WithError(err).Error("error acquiring lock to purge oauth tokens")
+		return err
+	}
+
+	if !ok {
+		log.Info("oauth tokens purge lock not acquired, purging in background")
+		return nil
+	}
+
+	keys, err := redisCluster.ScanKeys(oAuthClientTokensKeyPattern)
+
+	if err != nil {
+		log.WithError(err).Error("error while scanning for tokens")
+		return err
+	}
+
+	nowTs := time.Now().Unix()
+	// clean up expired tokens in sorted set (remove all tokens with score up to current timestamp minus retention)
+	cleanupStartScore := strconv.FormatInt(nowTs-int64(gw.GetConfig().OauthTokenExpiredRetainPeriod), 10)
+
+	var wg sync.WaitGroup
+
+	errs := make(chan error, len(keys))
+	for _, key := range keys {
+		wg.Add(1)
+		go func(k string) {
+			defer wg.Done()
+			if err := redisCluster.RemoveSortedSetRange(k, "-inf", cleanupStartScore); err != nil {
+				errs <- err
+			}
+		}(key)
+	}
+
+	// Wait for all goroutines to finish
+	wg.Wait()
+	close(errs)
+
+	combinedErr := &multierror.Error{
+		ErrorFormat: internalerrors.Formatter,
+	}
+
+	for err := range errs {
+		combinedErr = multierror.Append(combinedErr, err)
+	}
+
+	return combinedErr.ErrorOrNil()
 }

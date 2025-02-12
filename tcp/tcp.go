@@ -95,6 +95,7 @@ func (p *Proxy) Swap(new *Proxy) {
 	defer p.Unlock()
 
 	p.muxer = new.muxer
+	p.TLSConfigTarget = new.TLSConfigTarget
 }
 
 func (p *Proxy) RemoveDomainHandler(domain string) {
@@ -260,7 +261,7 @@ func (p *Proxy) handleConn(conn net.Conn) error {
 			if IsSocketClosed(err) && connectionClosed.Load().(bool) {
 				return
 			}
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				// End of stream from the client.
 				connectionClosed.Store(true)
 				log.WithField("conn", clientConn(conn)).Debug("End of client stream")
@@ -288,7 +289,7 @@ func (p *Proxy) handleConn(conn net.Conn) error {
 			if IsSocketClosed(err) && connectionClosed.Load().(bool) {
 				return
 			}
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				// End of stream from upstream
 				connectionClosed.Store(true)
 				log.WithField("conn", upstreamConn(rconn)).Debug("End of upstream stream")

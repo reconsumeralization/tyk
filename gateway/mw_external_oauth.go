@@ -11,18 +11,18 @@ import (
 	"strings"
 	"time"
 
-	"github.com/TykTechnologies/tyk/storage"
-
+	"github.com/go-jose/go-jose/v3"
 	"github.com/golang-jwt/jwt/v4"
-	"github.com/pmylund/go-cache"
-	"github.com/square/go-jose"
 
 	"github.com/TykTechnologies/tyk/apidef"
+	"github.com/TykTechnologies/tyk/storage"
 	"github.com/TykTechnologies/tyk/user"
+
+	"github.com/TykTechnologies/tyk/internal/cache"
 )
 
 var (
-	externalOAuthJWKCache           *cache.Cache
+	externalOAuthJWKCache           cache.Repository = cache.New(240, 30)
 	externalOAuthIntrospectionCache *introspectionCache
 	ErrTokenValidationFailed        = errors.New("error happened during the access token validation")
 	ErrKIDNotAString                = errors.New("kid is not a string")
@@ -30,7 +30,7 @@ var (
 )
 
 type ExternalOAuthMiddleware struct {
-	BaseMiddleware
+	*BaseMiddleware
 }
 
 func (k *ExternalOAuthMiddleware) Name() string {
@@ -38,6 +38,10 @@ func (k *ExternalOAuthMiddleware) Name() string {
 }
 
 func (k *ExternalOAuthMiddleware) EnabledForSpec() bool {
+	if k.Spec.ExternalOAuth.Enabled {
+		log.Warn("Support for external OAuth Middleware will be deprecated starting from 5.7.0. To avoid any disruptions, we recommend that you use JSON Web Token (JWT) instead, as explained in https://tyk.io/docs/basic-config-and-security/security/authentication-authorization/ext-oauth-middleware/")
+	}
+
 	return k.Spec.ExternalOAuth.Enabled
 }
 
@@ -160,10 +164,6 @@ func (k *ExternalOAuthMiddleware) getSecretFromJWKURL(url string, kid interface{
 		return nil, ErrKIDNotAString
 	}
 
-	if externalOAuthJWKCache == nil {
-		externalOAuthJWKCache = cache.New(240*time.Second, 30*time.Second)
-	}
-
 	var (
 		jwkSet *jose.JSONWebKeySet
 		err    error
@@ -233,7 +233,7 @@ func (k *ExternalOAuthMiddleware) introspection(accessToken string) (bool, strin
 		log.WithError(err).Debug("Doing OAuth introspection call")
 		claims, err = introspect(opts, accessToken)
 		if err != nil {
-			return false, "", fmt.Errorf("introspection err: %s", err)
+			return false, "", fmt.Errorf("introspection err: %w", err)
 		}
 
 		if opts.Cache.Enabled {
@@ -296,11 +296,14 @@ func isExpired(claims jwt.MapClaims) bool {
 }
 
 func newIntrospectionCache(gw *Gateway) *introspectionCache {
-	return &introspectionCache{RedisCluster: storage.RedisCluster{KeyPrefix: "introspection-", RedisController: gw.RedisController}}
+	conn := &storage.RedisCluster{KeyPrefix: "introspection-", ConnectionHandler: gw.StorageConnectionHandler}
+	conn.Connect()
+
+	return &introspectionCache{RedisCluster: conn}
 }
 
 type introspectionCache struct {
-	storage.RedisCluster
+	*storage.RedisCluster
 }
 
 func (c *introspectionCache) GetRes(token string) (jwt.MapClaims, bool) {
@@ -335,20 +338,20 @@ func introspect(opts apidef.Introspection, accessToken string) (jwt.MapClaims, e
 
 	res, err := http.Post(opts.URL, "application/x-www-form-urlencoded", strings.NewReader(body.Encode()))
 	if err != nil {
-		return nil, fmt.Errorf("error happened during the introspection call: %s", err)
+		return nil, fmt.Errorf("error happened during the introspection call: %w", err)
 	}
 
 	defer res.Body.Close()
 
 	bodyInBytes, err := io.ReadAll(res.Body)
 	if err != nil {
-		return nil, fmt.Errorf("couldn't read the introspection call response: %s", err)
+		return nil, fmt.Errorf("couldn't read the introspection call response: %w", err)
 	}
 
 	var claims jwt.MapClaims
 	err = json.Unmarshal(bodyInBytes, &claims)
 	if err != nil {
-		return nil, fmt.Errorf("couldn't unmarshal the introspection call response: %s", err)
+		return nil, fmt.Errorf("couldn't unmarshal the introspection call response: %w", err)
 	}
 
 	if res.StatusCode != http.StatusOK {

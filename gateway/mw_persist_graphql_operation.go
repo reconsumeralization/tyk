@@ -14,7 +14,7 @@ import (
 
 // PersistGraphQLOperationMiddleware lets you convert any HTTP request into a GraphQL Operation
 type PersistGraphQLOperationMiddleware struct {
-	BaseMiddleware
+	*BaseMiddleware
 }
 
 func (i *PersistGraphQLOperationMiddleware) Name() string {
@@ -22,7 +22,13 @@ func (i *PersistGraphQLOperationMiddleware) Name() string {
 }
 
 func (i *PersistGraphQLOperationMiddleware) EnabledForSpec() bool {
-	return true
+	for _, v := range i.Spec.VersionData.Versions {
+		if len(v.ExtendedPaths.PersistGraphQL) > 0 {
+			return true
+		}
+	}
+
+	return false
 }
 
 type GraphQLRequest struct {
@@ -40,6 +46,8 @@ func (i *PersistGraphQLOperationMiddleware) ProcessRequest(w http.ResponseWriter
 		return nil, http.StatusOK
 	}
 	mwSpec, _ := meta.(*apidef.PersistGraphQLMeta)
+
+	ctxSetRequestMethod(r, r.Method)
 	r.Method = http.MethodPost
 
 	_, err := io.ReadAll(r.Body)
@@ -66,7 +74,7 @@ func (i *PersistGraphQLOperationMiddleware) ProcessRequest(w http.ResponseWriter
 		return ProxyingRequestFailedErr, http.StatusInternalServerError
 	}
 
-	variablesStr := i.Gw.replaceTykVariables(r, string(varBytes), false)
+	variablesStr := i.Gw.ReplaceTykVariables(r, string(varBytes), false)
 
 	requestPathParts := strings.Split(r.RequestURI, "/")
 	for replacer, pathIndex := range replacers {
@@ -90,6 +98,9 @@ func (i *PersistGraphQLOperationMiddleware) ProcessRequest(w http.ResponseWriter
 	nopCloseRequestBody(r)
 
 	r.Header.Set("Content-Type", "application/json")
+
+	ctxSetUrlRewritePath(r, r.URL.Path)
+	r.URL.Path = "/"
 
 	return nil, http.StatusOK
 }
