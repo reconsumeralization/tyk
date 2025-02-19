@@ -8,53 +8,38 @@ import (
 	"sync"
 	"time"
 
-	"github.com/TykTechnologies/tyk/rpc"
-
 	"github.com/sirupsen/logrus"
 
 	"github.com/TykTechnologies/tyk/header"
+	"github.com/TykTechnologies/tyk/internal/model"
+	"github.com/TykTechnologies/tyk/rpc"
 	"github.com/TykTechnologies/tyk/storage"
 )
 
 type (
-	HealthCheckStatus string
-
-	HealthCheckComponentType string
+	HealthCheckItem     = model.HealthCheckItem
+	HealthCheckStatus   = model.HealthCheckStatus
+	HealthCheckResponse = model.HealthCheckResponse
 )
 
 const (
-	Pass HealthCheckStatus = "pass"
-	Fail                   = "fail"
-	Warn                   = "warn"
-
-	Component HealthCheckComponentType = "component"
-	Datastore                          = "datastore"
-	System                             = "system"
+	Pass      = model.Pass
+	Fail      = model.Fail
+	Warn      = model.Warn
+	Datastore = model.Datastore
+	System    = model.System
 )
 
-func (gw *Gateway) setCurrentHealthCheckInfo(h map[string]HealthCheckItem) {
+func (gw *Gateway) setCurrentHealthCheckInfo(h map[string]model.HealthCheckItem) {
 	gw.healthCheckInfo.Store(h)
 }
 
 func (gw *Gateway) getHealthCheckInfo() map[string]HealthCheckItem {
-	ret := gw.healthCheckInfo.Load().(map[string]HealthCheckItem)
+	ret, ok := gw.healthCheckInfo.Load().(map[string]HealthCheckItem)
+	if !ok {
+		return make(map[string]HealthCheckItem, 0)
+	}
 	return ret
-}
-
-type HealthCheckResponse struct {
-	Status      HealthCheckStatus          `json:"status"`
-	Version     string                     `json:"version,omitempty"`
-	Output      string                     `json:"output,omitempty"`
-	Description string                     `json:"description,omitempty"`
-	Details     map[string]HealthCheckItem `json:"details,omitempty"`
-}
-
-type HealthCheckItem struct {
-	Status        HealthCheckStatus `json:"status"`
-	Output        string            `json:"output,omitempty"`
-	ComponentType string            `json:"componentType,omitempty"`
-	ComponentID   string            `json:"componentId,omitempty"`
-	Time          string            `json:"time"`
 }
 
 func (gw *Gateway) initHealthCheck(ctx context.Context) {
@@ -62,12 +47,11 @@ func (gw *Gateway) initHealthCheck(ctx context.Context) {
 
 	go func(ctx context.Context) {
 		var n = gw.GetConfig().LivenessCheck.CheckDuration
-
 		if n == 0 {
-			n = 10
+			n = 10 * time.Second
 		}
 
-		ticker := time.NewTicker(time.Second * n)
+		ticker := time.NewTicker(n)
 
 		for {
 			select {
@@ -94,7 +78,8 @@ type SafeHealthCheck struct {
 func (gw *Gateway) gatherHealthChecks() {
 	allInfos := SafeHealthCheck{info: make(map[string]HealthCheckItem, 3)}
 
-	redisStore := storage.RedisCluster{KeyPrefix: "livenesscheck-", RedisController: gw.RedisController}
+	redisStore := storage.RedisCluster{KeyPrefix: "livenesscheck-", ConnectionHandler: gw.StorageConnectionHandler}
+	redisStore.Connect()
 
 	key := "tyk-liveness-probe"
 

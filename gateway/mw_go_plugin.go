@@ -2,17 +2,19 @@ package gateway
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"net/http"
 	"time"
+
+	"github.com/TykTechnologies/tyk/ctx"
 
 	"github.com/TykTechnologies/tyk-pump/analytics"
 	"github.com/TykTechnologies/tyk/apidef"
 
 	"github.com/sirupsen/logrus"
 
-	"github.com/TykTechnologies/tyk/ctx"
 	"github.com/TykTechnologies/tyk/goplugin"
 	"github.com/TykTechnologies/tyk/request"
 )
@@ -86,7 +88,8 @@ func (w *customResponseWriter) getHttpResponse(r *http.Request) *http.Response {
 
 // GoPluginMiddleware is a generic middleware that will execute Go-plugin code before continuing
 type GoPluginMiddleware struct {
-	BaseMiddleware
+	*BaseMiddleware
+
 	Path           string // path to .so file
 	SymbolName     string // function symbol to look up
 	handler        http.HandlerFunc
@@ -109,8 +112,10 @@ func (m *GoPluginMiddleware) EnabledForSpec() bool {
 
 	// per path go plugins
 	for _, version := range m.Spec.VersionData.Versions {
-		if len(version.ExtendedPaths.GoPlugin) > 0 {
-			return true
+		for _, p := range version.ExtendedPaths.GoPlugin {
+			if !p.Disabled {
+				return true
+			}
 		}
 	}
 
@@ -135,7 +140,7 @@ func (m *GoPluginMiddleware) loadPlugin() bool {
 	// try to load plugin
 	var err error
 
-	newPath, err := goplugin.GetPluginFileNameToLoad(goplugin.FileSystemStorage{}, m.Path, VERSION)
+	newPath, err := goplugin.GetPluginFileNameToLoad(goplugin.FileSystemStorage{}, m.Path)
 	if err != nil {
 		m.logger.WithError(err).Error("plugin file not found")
 		return false
@@ -157,7 +162,7 @@ func (m *GoPluginMiddleware) loadPlugin() bool {
 	}
 
 	// to record 2XX hits in analytics
-	m.successHandler = &SuccessHandler{BaseMiddleware: m.BaseMiddleware}
+	m.successHandler = &SuccessHandler{BaseMiddleware: m.BaseMiddleware.Copy()}
 	return true
 }
 
@@ -172,16 +177,24 @@ func (m *GoPluginMiddleware) goPluginFromRequest(r *http.Request) (*GoPluginMidd
 	return perPathPerMethodGoPlugin.(*GoPluginMiddleware), found
 }
 func (m *GoPluginMiddleware) ProcessRequest(w http.ResponseWriter, r *http.Request, conf interface{}) (err error, respCode int) {
-	// if a Go plugin is found for this path, override the base handler and logger:
 	logger := m.logger
 	handler := m.handler
+	successHandler := m.successHandler
+
 	if !m.APILevel {
+		// if a Go plugin is found for this path, override the base handler and logger
 		if pluginMw, found := m.goPluginFromRequest(r); found {
 			logger = pluginMw.logger
 			handler = pluginMw.handler
+			successHandler = &SuccessHandler{BaseMiddleware: m.BaseMiddleware.Copy()}
+		} else {
+			return nil, http.StatusOK // next middleware
 		}
 	}
+
 	if handler == nil {
+		respCode = http.StatusInternalServerError
+		err = errors.New(http.StatusText(respCode))
 		return
 	}
 
@@ -209,8 +222,19 @@ func (m *GoPluginMiddleware) ProcessRequest(w http.ResponseWriter, r *http.Reque
 	t1 := time.Now()
 
 	// Inject definition into request context:
-	ctx.SetDefinition(r, m.Spec.APIDefinition)
+	if m.Spec.IsOAS {
+		ctx.SetOASDefinition(r, &m.Spec.OAS)
+	} else {
+		ctx.SetDefinition(r, m.Spec.APIDefinition)
+	}
+
 	handler(rw, r)
+	if session := ctxGetSession(r); session != nil {
+		if err := m.ApplyPolicies(session); err != nil {
+			m.Logger().WithError(err).Error("Could not apply policy to session")
+			return errors.New(http.StatusText(http.StatusInternalServerError)), http.StatusInternalServerError
+		}
+	}
 
 	// calculate latency
 	ms := DurationToMillisecond(time.Since(t1))
@@ -236,7 +260,7 @@ func (m *GoPluginMiddleware) ProcessRequest(w http.ResponseWriter, r *http.Reque
 			logger.WithError(err).Error("Failed to process request with Go-plugin middleware func")
 		default:
 			// record 2XX to analytics
-			m.successHandler.RecordHit(r, analytics.Latency{Total: int64(ms)}, rw.statusCodeSent, rw.getHttpResponse(r))
+			successHandler.RecordHit(r, analytics.Latency{Total: int64(ms)}, rw.statusCodeSent, rw.getHttpResponse(r), false)
 
 			// no need to continue passing this request down to reverse proxy
 			respCode = mwStatusRespond

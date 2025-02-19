@@ -4,7 +4,6 @@ import (
 	"errors"
 	"net/http"
 	"sync"
-	"time"
 
 	"github.com/TykTechnologies/tyk/ctx"
 	"github.com/TykTechnologies/tyk/request"
@@ -22,7 +21,8 @@ var orgActiveMap sync.Map
 // RateLimitAndQuotaCheck will check the incoming request and key whether it is within it's quota and
 // within it's rate limit, it makes use of the SessionLimiter object to do this
 type OrganizationMonitor struct {
-	BaseMiddleware
+	*BaseMiddleware
+
 	sessionlimiter SessionLimiter
 	mon            Monitor
 }
@@ -102,15 +102,17 @@ func (k *OrganizationMonitor) ProcessRequestLive(r *http.Request, orgSession *us
 		return errors.New("this organisation access has been disabled, please contact your API administrator"), http.StatusForbidden
 	}
 
+	customQuotaKey := ""
+
 	// We found a session, apply the quota and rate limiter
 	reason := k.Gw.SessionLimiter.ForwardMessage(
 		r,
 		orgSession,
 		k.Spec.OrgID,
+		customQuotaKey,
 		k.Spec.OrgSessionManager.Store(),
 		orgSession.Per > 0 && orgSession.Rate > 0,
 		true,
-		&k.Spec.GlobalConfig,
 		k.Spec,
 		false,
 	)
@@ -120,7 +122,7 @@ func (k *OrganizationMonitor) ProcessRequestLive(r *http.Request, orgSession *us
 	if err := k.Spec.OrgSessionManager.UpdateSession(k.Spec.OrgID, orgSession, sessionLifeTime, false); err == nil {
 		// update in-app cache if needed
 		if !k.Spec.GlobalConfig.LocalSessionCache.DisableCacheSessionState {
-			k.Gw.SessionCache.Set(k.Spec.OrgID, orgSession.Clone(), time.Second*time.Duration(sessionLifeTime))
+			k.Gw.SessionCache.Set(k.Spec.OrgID, orgSession.Clone(), sessionLifeTime)
 		}
 	} else {
 		logger.WithError(err).Error("Could not update org session")
@@ -233,15 +235,18 @@ func (k *OrganizationMonitor) AllowAccessNext(
 		orgChan <- false
 		return
 	}
+
+	customQuotaKey := ""
+
 	// We found a session, apply the quota and rate limiter
 	reason := k.Gw.SessionLimiter.ForwardMessage(
 		r,
 		session,
 		k.Spec.OrgID,
+		customQuotaKey,
 		k.Spec.OrgSessionManager.Store(),
 		session.Per > 0 && session.Rate > 0,
 		true,
-		&k.Spec.GlobalConfig,
 		k.Spec,
 		false,
 	)
@@ -251,7 +256,7 @@ func (k *OrganizationMonitor) AllowAccessNext(
 	if err := k.Spec.OrgSessionManager.UpdateSession(k.Spec.OrgID, session, sessionLifeTime, false); err == nil {
 		// update in-app cache if needed
 		if !k.Spec.GlobalConfig.LocalSessionCache.DisableCacheSessionState {
-			k.Gw.SessionCache.Set(k.Spec.OrgID, session.Clone(), time.Second*time.Duration(sessionLifeTime))
+			k.Gw.SessionCache.Set(k.Spec.OrgID, session.Clone(), sessionLifeTime)
 		}
 	} else {
 		logEntry.WithError(err).WithField("orgID", k.Spec.OrgID).Error("Could not update org session")

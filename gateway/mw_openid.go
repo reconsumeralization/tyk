@@ -19,7 +19,8 @@ import (
 const OIDPREFIX = "openid"
 
 type OpenIDMW struct {
-	BaseMiddleware
+	*BaseMiddleware
+
 	providerConfiguration     *openid.Configuration
 	provider_client_policymap map[string]map[string]string
 	lock                      sync.RWMutex
@@ -30,6 +31,10 @@ func (k *OpenIDMW) Name() string {
 }
 
 func (k *OpenIDMW) EnabledForSpec() bool {
+	if k.Spec.UseOpenID {
+		log.Warn("Support for OpenID Connect Middleware will be deprecated starting from 5.7.0. To avoid any disruptions, we recommend that you use JSON Web Token (JWT) instead, as explained in https://tyk.io/docs/basic-config-and-security/security/authentication-authorization/openid-connect/")
+	}
+
 	return k.Spec.UseOpenID
 }
 
@@ -127,7 +132,7 @@ func (k *OpenIDMW) ProcessRequest(w http.ResponseWriter, r *http.Request, _ inte
 	}
 
 	// decide if we use policy ID from provider client settings or list of policies from scope-policy mapping
-	useScope := len(k.Spec.Scopes.OIDC.ScopeToPolicy) != 0
+	useScope := len(k.Spec.GetScopeToPolicyMapping()) != 0
 
 	k.lock.RLock()
 	clientSet, foundIssuer := k.provider_client_policymap[iss.(string)]
@@ -181,14 +186,14 @@ func (k *OpenIDMW) ProcessRequest(w http.ResponseWriter, r *http.Request, _ inte
 	if !useScope {
 		policiesToApply = append(policiesToApply, policyID)
 	} else {
-		scopeClaimName := k.Spec.Scopes.OIDC.ScopeClaimName
+		scopeClaimName := k.Spec.GetScopeClaimName()
 		if scopeClaimName == "" {
 			scopeClaimName = "scope"
 		}
 
 		if scope := getScopeFromClaim(token.Claims.(jwt.MapClaims), scopeClaimName); scope != nil {
 			// add all policies matched from scope-policy mapping
-			policiesToApply = mapScopeToPolicies(k.Spec.Scopes.OIDC.ScopeToPolicy, scope)
+			policiesToApply = mapScopeToPolicies(k.Spec.GetScopeToPolicyMapping(), scope)
 		}
 	}
 

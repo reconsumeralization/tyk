@@ -4,13 +4,13 @@ import (
 	"net/http"
 	"strings"
 
-	uuid "github.com/satori/go.uuid"
+	"github.com/TykTechnologies/tyk/internal/uuid"
 
 	"github.com/TykTechnologies/tyk/request"
 )
 
 type MiddlewareContextVars struct {
-	BaseMiddleware
+	*BaseMiddleware
 }
 
 func (m *MiddlewareContextVars) Name() string {
@@ -33,7 +33,7 @@ func (m *MiddlewareContextVars) ProcessRequest(w http.ResponseWriter, r *http.Re
 		"path_parts":   strings.Split(r.URL.Path, "/"), // Path parts
 		"path":         r.URL.Path,                     // path data
 		"remote_addr":  request.RealIP(r),              // IP
-		"request_id":   uuid.NewV4().String(),          //Correlation ID
+		"request_id":   uuid.New(),                     //Correlation ID
 	}
 
 	for hname, vals := range r.Header {
@@ -44,6 +44,13 @@ func (m *MiddlewareContextVars) ProcessRequest(w http.ResponseWriter, r *http.Re
 	for _, c := range r.Cookies() {
 		name := "cookies_" + strings.Replace(c.Name, "-", "_", -1)
 		contextDataObject[name] = c.Value
+	}
+
+	for key, vals := range r.Form {
+		name := "request_data_" + strings.Replace(key, "-", "_", -1)
+		if len(vals) > 0 {
+			contextDataObject[name] = vals[0]
+		}
 	}
 
 	ctxSetData(r, contextDataObject)

@@ -50,7 +50,8 @@ type VMResponseObject struct {
 
 // DynamicMiddleware is a generic middleware that will execute JS code before continuing
 type VirtualEndpoint struct {
-	BaseMiddleware
+	*BaseMiddleware
+
 	sh SuccessHandler
 }
 
@@ -63,7 +64,7 @@ func (gw *Gateway) preLoadVirtualMetaCode(meta *apidef.VirtualMeta, j *JSVM) {
 	// nil.
 	var src interface{}
 	switch meta.FunctionSourceType {
-	case "file":
+	case apidef.UseFile:
 		j.Log.Debug("Loading JS Endpoint File: ", meta.FunctionSourceURI)
 		f, err := os.Open(meta.FunctionSourceURI)
 		if err != nil {
@@ -71,7 +72,7 @@ func (gw *Gateway) preLoadVirtualMetaCode(meta *apidef.VirtualMeta, j *JSVM) {
 			return
 		}
 		src = f
-	case "blob":
+	case apidef.UseBlob:
 		if gw.GetConfig().DisableVirtualPathBlobs {
 			j.Log.Error("[JSVM] Blobs not allowed on this node")
 			return
@@ -102,13 +103,7 @@ func (d *VirtualEndpoint) EnabledForSpec() bool {
 		return false
 	}
 
-	for _, version := range d.Spec.VersionData.Versions {
-		if len(version.ExtendedPaths.Virtual) > 0 {
-			return true
-		}
-	}
-
-	return false
+	return d.Spec.hasVirtualEndpoint()
 }
 
 func (d *VirtualEndpoint) getMetaFromRequest(r *http.Request) *apidef.VirtualMeta {
@@ -239,7 +234,7 @@ func (d *VirtualEndpoint) ServeHTTPForCache(w http.ResponseWriter, r *http.Reque
 	d.Logger().Debug("JSVM Virtual Endpoint execution took: (ms) ", ms)
 
 	if copiedResponse != nil {
-		d.sh.RecordHit(r, analytics.Latency{Total: int64(ms)}, copiedResponse.StatusCode, copiedResponse)
+		d.sh.RecordHit(r, analytics.Latency{Total: int64(ms)}, copiedResponse.StatusCode, copiedResponse, false)
 	}
 
 	return copiedResponse, nil

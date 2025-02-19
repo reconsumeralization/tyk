@@ -4,11 +4,15 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
-	"reflect"
 	"sort"
 	"strings"
 
-	uuid "github.com/satori/go.uuid"
+	"github.com/TykTechnologies/tyk/internal/reflect"
+	"github.com/TykTechnologies/tyk/internal/uuid"
+)
+
+const (
+	ResponseProcessorResponseBodyTransform = "response_body_transform"
 )
 
 var (
@@ -59,14 +63,22 @@ func (a *APIDefinition) MigrateVersioning() (versions []APIDefinition, err error
 		for vName, vInfo := range a.VersionData.Versions {
 			newAPI := *a
 
-			newID := uuid.NewV4()
-			apiID := strings.Replace(newID.String(), "-", "", -1)
+			apiID := uuid.NewHex()
 
 			newAPI.APIID = apiID
 			newAPI.Id = ""
 			newAPI.Name += "-" + url.QueryEscape(vName)
 			newAPI.Internal = true
-			newAPI.Proxy.ListenPath = strings.TrimSuffix(newAPI.Proxy.ListenPath, "/") + "-" + url.QueryEscape(vName) + "/"
+
+			listenPathClean := strings.TrimSuffix(newAPI.Proxy.ListenPath, "/")
+			if listenPathClean == "" {
+				listenPathClean = "/" + url.QueryEscape(vName) + "/"
+			} else {
+				listenPathClean += "-" + url.QueryEscape(vName) + "/"
+			}
+
+			newAPI.Proxy.ListenPath = listenPathClean
+
 			newAPI.VersionDefinition = VersionDefinition{BaseID: a.APIID}
 			newAPI.VersionName = vName
 
@@ -226,11 +238,17 @@ func (a *APIDefinition) Migrate() (versions []APIDefinition, err error) {
 	a.migrateCustomPluginAuth()
 	a.MigrateAuthentication()
 	a.migratePluginBundle()
+	a.migratePluginConfigData()
 	a.migrateMutualTLS()
 	a.migrateCertificatePinning()
 	a.migrateGatewayTags()
 	a.migrateAuthenticationPlugin()
+	a.migrateIDExtractor()
 	a.migrateCustomDomain()
+	a.migrateScopeToPolicy()
+	a.migrateResponseProcessors()
+	a.migrateGlobalRateLimit()
+	a.migrateIPAccessControl()
 
 	versions, err = a.MigrateVersioning()
 	if err != nil {
@@ -239,9 +257,13 @@ func (a *APIDefinition) Migrate() (versions []APIDefinition, err error) {
 
 	a.MigrateEndpointMeta()
 	a.MigrateCachePlugin()
+	a.migrateGlobalHeaders()
+	a.migrateGlobalResponseHeaders()
 	for i := 0; i < len(versions); i++ {
 		versions[i].MigrateEndpointMeta()
 		versions[i].MigrateCachePlugin()
+		versions[i].migrateGlobalHeaders()
+		versions[i].migrateGlobalResponseHeaders()
 	}
 
 	return versions, nil
@@ -250,6 +272,12 @@ func (a *APIDefinition) Migrate() (versions []APIDefinition, err error) {
 func (a *APIDefinition) migratePluginBundle() {
 	if !a.CustomMiddlewareBundleDisabled && a.CustomMiddlewareBundle == "" {
 		a.CustomMiddlewareBundleDisabled = true
+	}
+}
+
+func (a *APIDefinition) migratePluginConfigData() {
+	if reflect.IsEmpty(a.ConfigData) {
+		a.ConfigDataDisabled = true
 	}
 }
 
@@ -281,14 +309,36 @@ func (a *APIDefinition) migrateGatewayTags() {
 }
 
 func (a *APIDefinition) migrateAuthenticationPlugin() {
-	if reflect.DeepEqual(a.CustomMiddleware.AuthCheck, MiddlewareDefinition{}) {
+	if reflect.IsEmpty(a.CustomMiddleware.AuthCheck) {
 		a.CustomMiddleware.AuthCheck.Disabled = true
+	}
+}
+
+func (a *APIDefinition) migrateIDExtractor() {
+	if reflect.IsEmpty(a.CustomMiddleware.IdExtractor) {
+		a.CustomMiddleware.IdExtractor.Disabled = true
 	}
 }
 
 func (a *APIDefinition) migrateCustomDomain() {
 	if !a.DomainDisabled && a.Domain == "" {
 		a.DomainDisabled = true
+	}
+}
+
+func (a *APIDefinition) migrateGlobalHeaders() {
+	vInfo := a.VersionData.Versions[""]
+	if len(vInfo.GlobalHeaders) == 0 && len(vInfo.GlobalHeadersRemove) == 0 {
+		vInfo.GlobalHeadersDisabled = true
+		a.VersionData.Versions[""] = vInfo
+	}
+}
+
+func (a *APIDefinition) migrateGlobalResponseHeaders() {
+	vInfo := a.VersionData.Versions[""]
+	if len(vInfo.GlobalResponseHeaders) == 0 && len(vInfo.GlobalResponseHeadersRemove) == 0 {
+		vInfo.GlobalResponseHeadersDisabled = true
+		a.VersionData.Versions[""] = vInfo
 	}
 }
 
@@ -384,6 +434,10 @@ func (a *APIDefinition) SetDisabledFlags() {
 	a.CertificatePinningDisabled = true
 	a.DomainDisabled = true
 	a.CustomMiddlewareBundleDisabled = true
+	a.CustomMiddleware.IdExtractor.Disabled = true
+	a.ConfigDataDisabled = true
+	a.Proxy.ServiceDiscovery.CacheDisabled = true
+	a.UptimeTests.Config.ServiceDiscovery.CacheDisabled = true
 	for i := 0; i < len(a.CustomMiddleware.Pre); i++ {
 		a.CustomMiddleware.Pre[i].Disabled = true
 	}
@@ -399,4 +453,81 @@ func (a *APIDefinition) SetDisabledFlags() {
 	for i := 0; i < len(a.CustomMiddleware.Response); i++ {
 		a.CustomMiddleware.Response[i].Disabled = true
 	}
+
+	for version := range a.VersionData.Versions {
+		for i := 0; i < len(a.VersionData.Versions[version].ExtendedPaths.Virtual); i++ {
+			a.VersionData.Versions[version].ExtendedPaths.Virtual[i].Disabled = true
+		}
+
+		for i := 0; i < len(a.VersionData.Versions[version].ExtendedPaths.GoPlugin); i++ {
+			a.VersionData.Versions[version].ExtendedPaths.GoPlugin[i].Disabled = true
+		}
+	}
+
+	if a.GlobalRateLimit.Per <= 0 || a.GlobalRateLimit.Rate <= 0 {
+		a.GlobalRateLimit.Disabled = true
+	}
+
+	a.DoNotTrack = true
+
+	a.setEventHandlersDisabledFlags()
+}
+
+func (a *APIDefinition) setEventHandlersDisabledFlags() {
+	for k := range a.EventHandlers.Events {
+		for i := range a.EventHandlers.Events[k] {
+			if a.EventHandlers.Events[k][i].HandlerMeta != nil {
+				a.EventHandlers.Events[k][i].HandlerMeta["disabled"] = true
+			}
+		}
+	}
+}
+
+func (a *APIDefinition) migrateScopeToPolicy() {
+	scopeClaim := ScopeClaim{
+		ScopeClaimName: a.JWTScopeClaimName,
+		ScopeToPolicy:  a.JWTScopeToPolicyMapping,
+	}
+
+	a.JWTScopeToPolicyMapping = nil
+	a.JWTScopeClaimName = ""
+
+	if a.UseOpenID {
+		a.Scopes.OIDC = scopeClaim
+		return
+	}
+
+	a.Scopes.JWT = scopeClaim
+}
+
+func (a *APIDefinition) migrateResponseProcessors() {
+	var responseProcessors []ResponseProcessor
+	for i := range a.ResponseProcessors {
+		if a.ResponseProcessors[i].Name == ResponseProcessorResponseBodyTransform {
+			continue
+		}
+		responseProcessors = append(responseProcessors, a.ResponseProcessors[i])
+	}
+
+	a.ResponseProcessors = responseProcessors
+}
+
+func (a *APIDefinition) migrateGlobalRateLimit() {
+	if a.GlobalRateLimit.Per <= 0 || a.GlobalRateLimit.Rate <= 0 {
+		a.GlobalRateLimit.Disabled = true
+	}
+}
+
+func (a *APIDefinition) migrateIPAccessControl() {
+	a.IPAccessControlDisabled = false
+
+	if a.EnableIpBlacklisting && len(a.BlacklistedIPs) > 0 {
+		return
+	}
+
+	if a.EnableIpWhiteListing && len(a.AllowedIPs) > 0 {
+		return
+	}
+
+	a.IPAccessControlDisabled = true
 }

@@ -9,6 +9,7 @@ import (
 	"github.com/getkin/kin-openapi/openapi3"
 
 	"github.com/TykTechnologies/tyk/apidef"
+	"github.com/TykTechnologies/tyk/internal/oasutil"
 )
 
 // Operations holds Operation definitions.
@@ -25,12 +26,28 @@ type Operation struct {
 	// IgnoreAuthentication ignores authentication on request by allowance.
 	IgnoreAuthentication *Allowance `bson:"ignoreAuthentication,omitempty" json:"ignoreAuthentication,omitempty"`
 
+	// Internal makes the endpoint only respond to internal requests.
+	Internal *Internal `bson:"internal,omitempty" json:"internal,omitempty"`
+
 	// TransformRequestMethod allows you to transform the method of a request.
 	TransformRequestMethod *TransformRequestMethod `bson:"transformRequestMethod,omitempty" json:"transformRequestMethod,omitempty"`
 
 	// TransformRequestBody allows you to transform request body.
 	// When both `path` and `body` are provided, body would take precedence.
-	TransformRequestBody *TransformRequestBody `bson:"transformRequestBody,omitempty" json:"transformRequestBody,omitempty"`
+	TransformRequestBody *TransformBody `bson:"transformRequestBody,omitempty" json:"transformRequestBody,omitempty"`
+
+	// TransformResponseBody allows you to transform response body.
+	// When both `path` and `body` are provided, body would take precedence.
+	TransformResponseBody *TransformBody `bson:"transformResponseBody,omitempty" json:"transformResponseBody,omitempty"`
+
+	// TransformRequestHeaders allows you to transform request headers.
+	TransformRequestHeaders *TransformHeaders `bson:"transformRequestHeaders,omitempty" json:"transformRequestHeaders,omitempty"`
+
+	// TransformResponseHeaders allows you to transform response headers.
+	TransformResponseHeaders *TransformHeaders `bson:"transformResponseHeaders,omitempty" json:"transformResponseHeaders,omitempty"`
+
+	// URLRewrite contains the URL rewriting configuration.
+	URLRewrite *URLRewrite `bson:"urlRewrite,omitempty" json:"urlRewrite,omitempty"`
 
 	// Cache contains the caching plugin configuration.
 	Cache *CachePlugin `bson:"cache,omitempty" json:"cache,omitempty"`
@@ -43,6 +60,27 @@ type Operation struct {
 
 	// MockResponse contains the mock response configuration.
 	MockResponse *MockResponse `bson:"mockResponse,omitempty" json:"mockResponse,omitempty"`
+
+	// VirtualEndpoint contains virtual endpoint configuration.
+	VirtualEndpoint *VirtualEndpoint `bson:"virtualEndpoint,omitempty" json:"virtualEndpoint,omitempty"`
+
+	// PostPlugins contains endpoint level post plugins configuration.
+	PostPlugins EndpointPostPlugins `bson:"postPlugins,omitempty" json:"postPlugins,omitempty"`
+
+	// CircuitBreaker contains the configuration for the circuit breaker functionality.
+	CircuitBreaker *CircuitBreaker `bson:"circuitBreaker,omitempty" json:"circuitBreaker,omitempty"`
+
+	// TrackEndpoint contains the configuration for enabling analytics and logs.
+	TrackEndpoint *TrackEndpoint `bson:"trackEndpoint,omitempty" json:"trackEndpoint,omitempty"`
+
+	// DoNotTrackEndpoint contains the configuration for disabling analytics and logs.
+	DoNotTrackEndpoint *TrackEndpoint `bson:"doNotTrackEndpoint,omitempty" json:"doNotTrackEndpoint,omitempty"`
+
+	// RequestSizeLimit limits the maximum allowed size of the request body in bytes.
+	RequestSizeLimit *RequestSizeLimit `bson:"requestSizeLimit,omitempty" json:"requestSizeLimit,omitempty"`
+
+	// RateLimit contains endpoint level rate limit configuration.
+	RateLimit *RateLimitEndpoint `bson:"rateLimit,omitempty" json:"rateLimit,omitempty"`
 }
 
 // AllowanceType holds the valid allowance types values.
@@ -79,7 +117,7 @@ func (o *Operation) Import(oasOperation *openapi3.Operation, overRideValues TykE
 			validate = &ValidateRequest{}
 		}
 
-		if shouldImport := validate.shouldImportValidateRequest(oasOperation); shouldImport {
+		if ok := validate.shouldImport(oasOperation); ok || overRideValues.pathItemHasParameters {
 			validate.Import(*overRideValues.ValidateRequest)
 			o.ValidateRequest = validate
 		}
@@ -91,7 +129,7 @@ func (o *Operation) Import(oasOperation *openapi3.Operation, overRideValues TykE
 			mock = &MockResponse{}
 		}
 
-		if shouldImport := mock.shouldImport(oasOperation); shouldImport {
+		if ok := mock.shouldImport(oasOperation); ok {
 			mock.Import(*overRideValues.MockResponse)
 			o.MockResponse = mock
 		}
@@ -110,30 +148,56 @@ func (s *OAS) fillPathsAndOperations(ep apidef.ExtendedPathsSet) {
 	s.fillAllowance(ep.Ignored, ignoreAuthentication)
 	s.fillTransformRequestMethod(ep.MethodTransforms)
 	s.fillTransformRequestBody(ep.Transform)
+	s.fillTransformResponseBody(ep.TransformResponse)
+	s.fillTransformRequestHeaders(ep.TransformHeader)
+	s.fillTransformResponseHeaders(ep.TransformResponseHeader)
+	s.fillURLRewrite(ep.URLRewrite)
+	s.fillInternal(ep.Internal)
 	s.fillCache(ep.AdvanceCacheConfig)
 	s.fillEnforceTimeout(ep.HardTimeouts)
 	s.fillOASValidateRequest(ep.ValidateJSON)
+	s.fillVirtualEndpoint(ep.Virtual)
+	s.fillEndpointPostPlugins(ep.GoPlugin)
+	s.fillCircuitBreaker(ep.CircuitBreaker)
+	s.fillTrackEndpoint(ep.TrackEndpoints)
+	s.fillDoNotTrackEndpoint(ep.DoNotTrackEndpoints)
+	s.fillRequestSizeLimit(ep.SizeLimit)
+	s.fillRateLimitEndpoints(ep.RateLimit)
 }
 
 func (s *OAS) extractPathsAndOperations(ep *apidef.ExtendedPathsSet) {
+	ep.Clear()
+
 	tykOperations := s.getTykOperations()
 	if len(tykOperations) == 0 {
 		return
 	}
 
-	for id, tykOp := range tykOperations {
-	found:
-		for path, pathItem := range s.Paths {
+	for _, pathItem := range oasutil.SortByPathLength(s.Paths) {
+		for id, tykOp := range tykOperations {
+			path := pathItem.Path
 			for method, operation := range pathItem.Operations() {
 				if id == operation.OperationID {
 					tykOp.extractAllowanceTo(ep, path, method, allow)
 					tykOp.extractAllowanceTo(ep, path, method, block)
 					tykOp.extractAllowanceTo(ep, path, method, ignoreAuthentication)
+					tykOp.extractInternalTo(ep, path, method)
 					tykOp.extractTransformRequestMethodTo(ep, path, method)
 					tykOp.extractTransformRequestBodyTo(ep, path, method)
+					tykOp.extractTransformResponseBodyTo(ep, path, method)
+					tykOp.extractTransformRequestHeadersTo(ep, path, method)
+					tykOp.extractTransformResponseHeadersTo(ep, path, method)
+					tykOp.extractURLRewriteTo(ep, path, method)
 					tykOp.extractCacheTo(ep, path, method)
 					tykOp.extractEnforceTimeoutTo(ep, path, method)
-					break found
+					tykOp.extractVirtualEndpointTo(ep, path, method)
+					tykOp.extractEndpointPostPluginTo(ep, path, method)
+					tykOp.extractCircuitBreakerTo(ep, path, method)
+					tykOp.extractTrackEndpointTo(ep, path, method)
+					tykOp.extractDoNotTrackEndpointTo(ep, path, method)
+					tykOp.extractRequestSizeLimitTo(ep, path, method)
+					tykOp.extractRateLimitEndpointTo(ep, path, method)
+					break
 				}
 			}
 		}
@@ -192,12 +256,60 @@ func (s *OAS) fillTransformRequestBody(metas []apidef.TemplateMeta) {
 		operation := s.GetTykExtension().getOperation(operationID)
 
 		if operation.TransformRequestBody == nil {
-			operation.TransformRequestBody = &TransformRequestBody{}
+			operation.TransformRequestBody = &TransformBody{}
 		}
 
 		operation.TransformRequestBody.Fill(meta)
 		if ShouldOmit(operation.TransformRequestBody) {
 			operation.TransformRequestBody = nil
+		}
+	}
+}
+
+func (s *OAS) fillTransformResponseBody(metas []apidef.TemplateMeta) {
+	for _, meta := range metas {
+		operationID := s.getOperationID(meta.Path, meta.Method)
+		operation := s.GetTykExtension().getOperation(operationID)
+
+		if operation.TransformResponseBody == nil {
+			operation.TransformResponseBody = &TransformBody{}
+		}
+
+		operation.TransformResponseBody.Fill(meta)
+		if ShouldOmit(operation.TransformResponseBody) {
+			operation.TransformResponseBody = nil
+		}
+	}
+}
+
+func (s *OAS) fillTransformRequestHeaders(metas []apidef.HeaderInjectionMeta) {
+	for _, meta := range metas {
+		operationID := s.getOperationID(meta.Path, meta.Method)
+		operation := s.GetTykExtension().getOperation(operationID)
+
+		if operation.TransformRequestHeaders == nil {
+			operation.TransformRequestHeaders = &TransformHeaders{}
+		}
+
+		operation.TransformRequestHeaders.Fill(meta)
+		if ShouldOmit(operation.TransformRequestHeaders) {
+			operation.TransformRequestHeaders = nil
+		}
+	}
+}
+
+func (s *OAS) fillTransformResponseHeaders(metas []apidef.HeaderInjectionMeta) {
+	for _, meta := range metas {
+		operationID := s.getOperationID(meta.Path, meta.Method)
+		operation := s.GetTykExtension().getOperation(operationID)
+
+		if operation.TransformResponseHeaders == nil {
+			operation.TransformResponseHeaders = &TransformHeaders{}
+		}
+
+		operation.TransformResponseHeaders.Fill(meta)
+		if ShouldOmit(operation.TransformResponseHeaders) {
+			operation.TransformResponseHeaders = nil
 		}
 	}
 }
@@ -228,6 +340,21 @@ func (s *OAS) fillEnforceTimeout(metas []apidef.HardTimeoutMeta) {
 		operation.EnforceTimeout.Fill(meta)
 		if ShouldOmit(operation.EnforceTimeout) {
 			operation.EnforceTimeout = nil
+		}
+	}
+}
+
+func (s *OAS) fillRequestSizeLimit(metas []apidef.RequestSizeMeta) {
+	for _, meta := range metas {
+		operationID := s.getOperationID(meta.Path, meta.Method)
+		operation := s.GetTykExtension().getOperation(operationID)
+		if operation.RequestSizeLimit == nil {
+			operation.RequestSizeLimit = &RequestSizeLimit{}
+		}
+
+		operation.RequestSizeLimit.Fill(meta)
+		if ShouldOmit(operation.RequestSizeLimit) {
+			operation.RequestSizeLimit = nil
 		}
 	}
 }
@@ -274,6 +401,36 @@ func (o *Operation) extractTransformRequestBodyTo(ep *apidef.ExtendedPathsSet, p
 	ep.Transform = append(ep.Transform, meta)
 }
 
+func (o *Operation) extractTransformResponseBodyTo(ep *apidef.ExtendedPathsSet, path string, method string) {
+	if o.TransformResponseBody == nil {
+		return
+	}
+
+	meta := apidef.TemplateMeta{Path: path, Method: method}
+	o.TransformResponseBody.ExtractTo(&meta)
+	ep.TransformResponse = append(ep.TransformResponse, meta)
+}
+
+func (o *Operation) extractTransformRequestHeadersTo(ep *apidef.ExtendedPathsSet, path string, method string) {
+	if o.TransformRequestHeaders == nil {
+		return
+	}
+
+	meta := apidef.HeaderInjectionMeta{Path: path, Method: method}
+	o.TransformRequestHeaders.ExtractTo(&meta)
+	ep.TransformHeader = append(ep.TransformHeader, meta)
+}
+
+func (o *Operation) extractTransformResponseHeadersTo(ep *apidef.ExtendedPathsSet, path string, method string) {
+	if o.TransformResponseHeaders == nil {
+		return
+	}
+
+	meta := apidef.HeaderInjectionMeta{Path: path, Method: method}
+	o.TransformResponseHeaders.ExtractTo(&meta)
+	ep.TransformResponseHeader = append(ep.TransformResponseHeader, meta)
+}
+
 func (o *Operation) extractCacheTo(ep *apidef.ExtendedPathsSet, path string, method string) {
 	if o.Cache == nil {
 		return
@@ -297,13 +454,24 @@ func (o *Operation) extractEnforceTimeoutTo(ep *apidef.ExtendedPathsSet, path st
 	ep.HardTimeouts = append(ep.HardTimeouts, meta)
 }
 
+func (o *Operation) extractRequestSizeLimitTo(ep *apidef.ExtendedPathsSet, path string, method string) {
+	if o.RequestSizeLimit == nil {
+		return
+	}
+
+	meta := apidef.RequestSizeMeta{Path: path, Method: method}
+	o.RequestSizeLimit.ExtractTo(&meta)
+	ep.SizeLimit = append(ep.SizeLimit, meta)
+}
+
 // detect possible regex pattern:
 // - character match ([a-z])
-// - greedy match (*)
-// - ungreedy match (+)
-// - any char (.)
+// - greedy match (.*)
+// - ungreedy match (.+)
 // - end of string ($).
-const regexPatterns = "[].+*$"
+var regexPatterns = []string{
+	".+", ".*", "[", "]", "$",
+}
 
 type pathPart struct {
 	name    string
@@ -319,17 +487,27 @@ func (p pathPart) String() string {
 	return p.value
 }
 
-// splitPath splits url into folder parts, detecting regex patterns.
+// isRegex checks if value has expected regular expression patterns.
+func isRegex(value string) bool {
+	for _, pattern := range regexPatterns {
+		if strings.Contains(value, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+// splitPath splits URL into folder parts, detecting regex patterns.
 func splitPath(inPath string) ([]pathPart, bool) {
-	// Each url fragment can contain a regex, but the whole
-	// url isn't just a regex (`/a/.*/foot` => `/a/{param1}/foot`)
+	// Each URL fragment can contain a regex, but the whole
+	// URL isn't just a regex (`/a/.*/foot` => `/a/{param1}/foot`)
 	parts := strings.Split(strings.Trim(inPath, "/"), "/")
 	result := make([]pathPart, len(parts))
 	found := 0
 
 	for k, value := range parts {
 		name := value
-		isRegex := strings.ContainsAny(value, regexPatterns)
+		isRegex := isRegex(value)
 		if isRegex {
 			found++
 			name = fmt.Sprintf("customRegex%d", found)
@@ -344,7 +522,7 @@ func splitPath(inPath string) ([]pathPart, bool) {
 	return result, found > 0
 }
 
-// buildPath converts the url paths with regex to named parameters
+// buildPath converts the URL paths with regex to named parameters
 // e.g. ["a", ".*"] becomes /a/{customRegex1}.
 func buildPath(parts []pathPart, appendSlash bool) string {
 	newPath := ""
@@ -393,6 +571,7 @@ func (s *OAS) getOperationID(inPath, method string) string {
 
 	if hasRegex {
 		newPath := buildPath(parts, strings.HasSuffix(inPath, "/"))
+
 		p = createOrGetPathItem(newPath)
 		p.Parameters = []*openapi3.ParameterRef{}
 
@@ -459,7 +638,11 @@ func (v *ValidateRequest) Fill(meta apidef.ValidatePathMeta) {
 	v.ErrorResponseCode = meta.ErrorResponseCode
 }
 
-func (*ValidateRequest) shouldImportValidateRequest(operation *openapi3.Operation) bool {
+func (*ValidateRequest) shouldImport(operation *openapi3.Operation) bool {
+	if len(operation.Parameters) > 0 {
+		return true
+	}
+
 	reqBody := operation.RequestBody
 	if reqBody == nil {
 		return false
@@ -534,21 +717,21 @@ func (s *OAS) fillOASValidateRequest(metas []apidef.ValidatePathMeta) {
 
 // MockResponse configures the mock responses.
 type MockResponse struct {
-	// Enabled enables the mock response middleware.
+	// Enabled activates the mock response middleware.
 	Enabled bool `bson:"enabled" json:"enabled"`
 	// Code is the HTTP response code that will be returned.
 	Code int `bson:"code,omitempty" json:"code,omitempty"`
 	// Body is the HTTP response body that will be returned.
 	Body string `bson:"body,omitempty" json:"body,omitempty"`
 	// Headers are the HTTP response headers that will be returned.
-	Headers []Header `bson:"headers,omitempty" json:"headers,omitempty"`
+	Headers Headers `bson:"headers,omitempty" json:"headers,omitempty"`
 	// FromOASExamples is the configuration to extract a mock response from OAS documentation.
 	FromOASExamples *FromOASExamples `bson:"fromOASExamples,omitempty" json:"fromOASExamples,omitempty"`
 }
 
-// FromOASExamples configures mock responses should be returned from OAS example responses.
+// FromOASExamples configures mock responses that should be returned from OAS example responses.
 type FromOASExamples struct {
-	// Enabled enables getting a mock response from OAS examples or schemas documented in OAS.
+	// Enabled activates getting a mock response from OAS examples or schemas documented in OAS.
 	Enabled bool `bson:"enabled" json:"enabled"`
 	// Code is the default HTTP response code that the gateway reads from the path responses documented in OAS.
 	Code int `bson:"code,omitempty" json:"code,omitempty"`
@@ -558,7 +741,7 @@ type FromOASExamples struct {
 	ExampleName string `bson:"exampleName,omitempty" json:"exampleName,omitempty"`
 }
 
-func (m *MockResponse) shouldImport(operation *openapi3.Operation) bool {
+func (*MockResponse) shouldImport(operation *openapi3.Operation) bool {
 	for _, response := range operation.Responses {
 		for _, content := range response.Value.Content {
 			if content.Example != nil || content.Schema != nil {
@@ -581,5 +764,105 @@ func (m *MockResponse) Import(enabled bool) {
 	m.Enabled = enabled
 	m.FromOASExamples = &FromOASExamples{
 		Enabled: enabled,
+	}
+}
+
+func (s *OAS) fillVirtualEndpoint(endpointMetas []apidef.VirtualMeta) {
+	for _, em := range endpointMetas {
+		operationID := s.getOperationID(em.Path, em.Method)
+		operation := s.GetTykExtension().getOperation(operationID)
+		if operation.VirtualEndpoint == nil {
+			operation.VirtualEndpoint = &VirtualEndpoint{}
+		}
+
+		operation.VirtualEndpoint.Fill(em)
+		if ShouldOmit(operation.VirtualEndpoint) {
+			operation.VirtualEndpoint = nil
+		}
+	}
+}
+
+func (o *Operation) extractVirtualEndpointTo(ep *apidef.ExtendedPathsSet, path string, method string) {
+	if o.VirtualEndpoint == nil {
+		return
+	}
+
+	meta := apidef.VirtualMeta{Path: path, Method: method}
+	o.VirtualEndpoint.ExtractTo(&meta)
+	ep.Virtual = append(ep.Virtual, meta)
+}
+
+func (s *OAS) fillRateLimitEndpoints(endpointMetas []apidef.RateLimitMeta) {
+	for _, em := range endpointMetas {
+		operationID := s.getOperationID(em.Path, em.Method)
+		operation := s.GetTykExtension().getOperation(operationID)
+		if operation.RateLimit == nil {
+			operation.RateLimit = &RateLimitEndpoint{}
+		}
+
+		operation.RateLimit.Fill(em)
+		if ShouldOmit(operation.RateLimit) {
+			operation.RateLimit = nil
+		}
+	}
+}
+
+func (o *Operation) extractRateLimitEndpointTo(ep *apidef.ExtendedPathsSet, path string, method string) {
+	if o.RateLimit == nil {
+		return
+	}
+
+	meta := apidef.RateLimitMeta{Path: path, Method: method}
+	o.RateLimit.ExtractTo(&meta)
+	ep.RateLimit = append(ep.RateLimit, meta)
+}
+
+func (s *OAS) fillEndpointPostPlugins(endpointMetas []apidef.GoPluginMeta) {
+	for _, em := range endpointMetas {
+		operationID := s.getOperationID(em.Path, em.Method)
+		operation := s.GetTykExtension().getOperation(operationID)
+		if operation.PostPlugins == nil {
+			operation.PostPlugins = make(EndpointPostPlugins, 1)
+		}
+
+		operation.PostPlugins.Fill(em)
+		if ShouldOmit(operation.PostPlugins) {
+			operation.PostPlugins = nil
+		}
+	}
+}
+
+func (o *Operation) extractEndpointPostPluginTo(ep *apidef.ExtendedPathsSet, path string, method string) {
+	if o.PostPlugins == nil {
+		return
+	}
+
+	meta := apidef.GoPluginMeta{Path: path, Method: method}
+	o.PostPlugins.ExtractTo(&meta)
+	ep.GoPlugin = append(ep.GoPlugin, meta)
+}
+
+func (o *Operation) extractCircuitBreakerTo(ep *apidef.ExtendedPathsSet, path string, method string) {
+	if o.CircuitBreaker == nil {
+		return
+	}
+
+	meta := apidef.CircuitBreakerMeta{Path: path, Method: method}
+	o.CircuitBreaker.ExtractTo(&meta)
+	ep.CircuitBreaker = append(ep.CircuitBreaker, meta)
+}
+
+func (s *OAS) fillCircuitBreaker(metas []apidef.CircuitBreakerMeta) {
+	for _, meta := range metas {
+		operationID := s.getOperationID(meta.Path, meta.Method)
+		operation := s.GetTykExtension().getOperation(operationID)
+		if operation.CircuitBreaker == nil {
+			operation.CircuitBreaker = &CircuitBreaker{}
+		}
+
+		operation.CircuitBreaker.Fill(meta)
+		if ShouldOmit(operation.CircuitBreaker) {
+			operation.CircuitBreaker = nil
+		}
 	}
 }

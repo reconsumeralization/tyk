@@ -2,6 +2,7 @@ package oas
 
 import (
 	"context"
+	"embed"
 	"strings"
 	"testing"
 
@@ -9,6 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"github.com/TykTechnologies/tyk/apidef"
+	"github.com/TykTechnologies/tyk/internal/time"
 )
 
 func minimumValidOAS() OAS {
@@ -21,6 +23,38 @@ func minimumValidOAS() OAS {
 			OpenAPI: DefaultOpenAPI,
 		},
 	}
+}
+
+//go:embed testdata/urlSorting.json
+var urlSortingFS embed.FS
+
+func TestOAS_PathsAndOperations_sorting(t *testing.T) {
+	var oasDef OAS
+	var classicDef apidef.APIDefinition
+
+	decode(t, urlSortingFS, &oasDef, "testdata/urlSorting.json")
+
+	oasDef.ExtractTo(&classicDef)
+
+	got := []string{}
+	for _, v := range classicDef.VersionData.Versions[""].ExtendedPaths.Ignored {
+		got = append(got, v.Path)
+	}
+
+	want := []string{
+		"/test/abc/def",
+		"/anything/dupa",
+		"/anything/dupe",
+		"/anything/dupi",
+		"/anything/dupo",
+		"/anything/{id}",
+		"/test/abc",
+		"/test/{id}",
+		"/anything",
+		"/test",
+	}
+
+	assert.Equal(t, want, got)
 }
 
 func TestOAS_PathsAndOperations(t *testing.T) {
@@ -40,9 +74,20 @@ func TestOAS_PathsAndOperations(t *testing.T) {
 
 	var operation Operation
 	Fill(t, &operation, 0)
-	operation.ValidateRequest = nil          // This one also fills native part, let's skip it for this test.
-	operation.MockResponse = nil             // This one also fills native part, let's skip it for this test.
-	operation.TransformRequestBody.Path = "" // if `path` and `body` are present, `body` would take precedence, detailed tests can be found in middleware_test.go
+	operation.TrackEndpoint = nil                     // This one also fills native part, let's skip it for this test.
+	operation.DoNotTrackEndpoint = nil                // This one also fills native part, let's skip it for this test.
+	operation.ValidateRequest = nil                   // This one also fills native part, let's skip it for this test.
+	operation.MockResponse = nil                      // This one also fills native part, let's skip it for this test.
+	operation.URLRewrite = nil                        // This one also fills native part, let's skip it for this test.
+	operation.Internal = nil                          // This one also fills native part, let's skip it for this test.
+	operation.TransformRequestBody.Path = ""          // if `path` and `body` are present, `body` would take precedence, detailed tests can be found in middleware_test.go
+	operation.TransformResponseBody.Path = ""         // if `path` and `body` are present, `body` would take precedence, detailed tests can be found in middleware_test.go
+	operation.VirtualEndpoint.Path = ""               // if `path` and `body` are present, `body` would take precedence, detailed tests can be found in middleware_test.go
+	operation.VirtualEndpoint.Name = ""               // Name is deprecated.
+	operation.PostPlugins = operation.PostPlugins[:1] // only 1 post plugin is considered at this point, ignore others.
+	operation.PostPlugins[0].Name = ""                // Name is deprecated.
+
+	operation.RateLimit.Per = ReadableDuration(time.Minute)
 
 	xTykAPIGateway := &XTykAPIGateway{
 		Middleware: &Middleware{
@@ -186,6 +231,8 @@ func TestOAS_RegexPaths(t *testing.T) {
 	}
 
 	tests := []test{
+		{"/v1.Service", "/v1.Service", 0},
+		{"/v1.Service/stats.Service", "/v1.Service/stats.Service", 0},
 		{"/.+", "/{customRegex1}", 1},
 		{"/.*", "/{customRegex1}", 1},
 		{"/[^a]*", "/{customRegex1}", 1},
@@ -199,12 +246,17 @@ func TestOAS_RegexPaths(t *testing.T) {
 
 	for i, tc := range tests {
 		var oas OAS
-		oas.Paths = openapi3.Paths{
-			tc.input: {
-				Get: &openapi3.Operation{},
-			},
-		}
+		oas.Paths = openapi3.Paths{}
 		_ = oas.getOperationID(tc.input, "GET")
+
+		pathKeys := make([]string, 0, len(oas.Paths))
+		for k := range oas.Paths {
+			pathKeys = append(pathKeys, k)
+		}
+
+		assert.Lenf(t, oas.Paths, 1, "Expected one path key being created, got %#v", pathKeys)
+		_, ok := oas.Paths[tc.want]
+		assert.True(t, ok)
 
 		p, ok := oas.Paths[tc.want]
 		assert.Truef(t, ok, "test %d: path doesn't exist in OAS: %v", i, tc.want)
@@ -224,8 +276,4 @@ func TestOAS_RegexPaths(t *testing.T) {
 
 		assert.Equalf(t, tc.input, got, "test %d: rebuilt link, expected %v, got %v", i, tc.input, got)
 	}
-}
-
-func TestValidateRequest(t *testing.T) {
-
 }

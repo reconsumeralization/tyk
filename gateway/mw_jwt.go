@@ -15,19 +15,19 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-jose/go-jose/v3"
 	"github.com/golang-jwt/jwt/v4"
 	"github.com/lonelycode/osin"
-	cache "github.com/pmylund/go-cache"
-	jose "github.com/square/go-jose"
 
 	"github.com/TykTechnologies/tyk/apidef"
 	"github.com/TykTechnologies/tyk/storage"
-
 	"github.com/TykTechnologies/tyk/user"
+
+	"github.com/TykTechnologies/tyk/internal/cache"
 )
 
 type JWTMiddleware struct {
-	BaseMiddleware
+	*BaseMiddleware
 }
 
 const (
@@ -60,7 +60,7 @@ func (k *JWTMiddleware) EnabledForSpec() bool {
 	return k.Spec.EnableJWT
 }
 
-var JWKCache *cache.Cache
+var JWKCache cache.Repository = cache.New(240, 30)
 
 type JWK struct {
 	Alg string   `json:"alg"`
@@ -87,11 +87,6 @@ func parseJWK(buf []byte) (*jose.JSONWebKeySet, error) {
 }
 
 func (k *JWTMiddleware) legacyGetSecretFromURL(url, kid, keyType string) (interface{}, error) {
-	// Implement a cache
-	if JWKCache == nil {
-		JWKCache = cache.New(240*time.Second, 30*time.Second)
-	}
-
 	var client http.Client
 	client.Transport = &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: k.Gw.GetConfig().JWTSSLInsecureSkipVerify},
@@ -139,11 +134,10 @@ func (k *JWTMiddleware) legacyGetSecretFromURL(url, kid, keyType string) (interf
 	return nil, errors.New("No matching KID could be found")
 }
 
-func (k *JWTMiddleware) getSecretFromURL(url, kid, keyType string) (interface{}, error) {
-	// Implement a cache
-	if JWKCache == nil {
-		k.Logger().Debug("Creating JWK Cache")
-		JWKCache = cache.New(240*time.Second, 30*time.Second)
+func (k *JWTMiddleware) getSecretFromURL(url string, kidVal interface{}, keyType string) (interface{}, error) {
+	kid, ok := kidVal.(string)
+	if !ok {
+		return nil, ErrKIDNotAString
 	}
 
 	var (
@@ -197,7 +191,7 @@ func (k *JWTMiddleware) getSecretToVerifySignature(r *http.Request, token *jwt.T
 	if config.JWTSource != "" {
 		// Is it a URL?
 		if httpScheme.MatchString(config.JWTSource) {
-			return k.getSecretFromURL(config.JWTSource, token.Header[KID].(string), k.Spec.JWTSigningMethod)
+			return k.getSecretFromURL(config.JWTSource, token.Header[KID], k.Spec.JWTSigningMethod)
 		}
 
 		// If not, return the actual value
@@ -208,12 +202,7 @@ func (k *JWTMiddleware) getSecretToVerifySignature(r *http.Request, token *jwt.T
 
 		// Is decoded url too?
 		if httpScheme.MatchString(string(decodedCert)) {
-			secret, err := k.getSecretFromURL(string(decodedCert), token.Header[KID].(string), k.Spec.JWTSigningMethod)
-			if err != nil {
-				return nil, err
-			}
-
-			return secret, nil
+			return k.getSecretFromURL(string(decodedCert), token.Header[KID], k.Spec.JWTSigningMethod)
 		}
 
 		return decodedCert, nil // Returns the decoded secret
@@ -286,18 +275,27 @@ func (k *JWTMiddleware) getUserIdFromClaim(claims jwt.MapClaims) (string, error)
 	return getUserIDFromClaim(claims, k.Spec.JWTIdentityBaseField)
 }
 
-func toStrings(v interface{}) []string {
+func toScopeStringsSlice(v interface{}, scopeSlice *[]string, nested bool) []string {
+	if scopeSlice == nil {
+		scopeSlice = &[]string{}
+	}
+
 	switch e := v.(type) {
 	case string:
-		return strings.Split(e, " ")
-	case []interface{}:
-		var r []string
-		for _, x := range e {
-			r = append(r, toStrings(x)...)
+		if !nested {
+			splitStringScopes := strings.Split(e, " ")
+			*scopeSlice = append(*scopeSlice, splitStringScopes...)
+		} else {
+			*scopeSlice = append(*scopeSlice, e)
 		}
-		return r
+
+	case []interface{}:
+		for _, scopeElement := range e {
+			toScopeStringsSlice(scopeElement, scopeSlice, true)
+		}
 	}
-	return nil
+
+	return *scopeSlice
 }
 
 func nestedMapLookup(m map[string]interface{}, ks ...string) interface{} {
@@ -324,7 +322,7 @@ func getMapContext(m interface{}, k string) (rval interface{}) {
 func getScopeFromClaim(claims jwt.MapClaims, scopeClaimName string) []string {
 	lookedUp := nestedMapLookup(claims, strings.Split(scopeClaimName, ".")...)
 
-	return toStrings(lookedUp)
+	return toScopeStringsSlice(lookedUp, nil, false)
 }
 
 func mapScopeToPolicies(mapping map[string]string, scope []string) []string {
@@ -516,13 +514,13 @@ func (k *JWTMiddleware) processCentralisedJWT(r *http.Request, token *jwt.Token)
 	}
 
 	// apply policies from scope if scope-to-policy mapping is specified for this API
-	if len(k.Spec.Scopes.JWT.ScopeToPolicy) != 0 {
-		scopeClaimName := k.Spec.Scopes.JWT.ScopeClaimName
+	if len(k.Spec.GetScopeToPolicyMapping()) != 0 {
+		scopeClaimName := k.Spec.GetScopeClaimName()
 		if scopeClaimName == "" {
 			scopeClaimName = "scope"
 		}
 
-		if scope := getScopeFromClaim(claims, scopeClaimName); scope != nil {
+		if scope := getScopeFromClaim(claims, scopeClaimName); len(scope) > 0 {
 			polIDs := []string{
 				basePolicyID, // add base policy as a first one
 			}
@@ -533,7 +531,7 @@ func (k *JWTMiddleware) processCentralisedJWT(r *http.Request, token *jwt.Token)
 			}
 
 			// add all policies matched from scope-policy mapping
-			mappedPolIDs := mapScopeToPolicies(k.Spec.Scopes.JWT.ScopeToPolicy, scope)
+			mappedPolIDs := mapScopeToPolicies(k.Spec.GetScopeToPolicyMapping(), scope)
 			if len(mappedPolIDs) > 0 {
 				k.Logger().Debugf("Identified policy(s) to apply to this token from scope claim: %s", scopeClaimName)
 			} else {
@@ -564,21 +562,33 @@ func (k *JWTMiddleware) processCentralisedJWT(r *http.Request, token *jwt.Token)
 		}
 	}
 
+	oauthClientID := ""
 	// Get the OAuth client ID if available:
-	oauthClientID := k.getOAuthClientIDFromClaim(claims)
-	session.OauthClientID = oauthClientID
-	if session.OauthClientID != "" {
+	if !k.Spec.IDPClientIDMappingDisabled {
+		oauthClientID = k.getOAuthClientIDFromClaim(claims)
+	}
+
+	if session.OauthClientID != oauthClientID {
+		session.OauthClientID = oauthClientID
+		updateSession = true
+	}
+
+	if !k.Spec.IDPClientIDMappingDisabled && oauthClientID != "" {
 		// Initialize the OAuthManager if empty:
 		if k.Spec.OAuthManager == nil {
 			prefix := generateOAuthPrefix(k.Spec.APIID)
 			storageManager := k.Gw.getGlobalMDCBStorageHandler(prefix, false)
 			storageManager.Connect()
+
+			storageDriver := &storage.RedisCluster{KeyPrefix: prefix, HashKeys: false, ConnectionHandler: k.Gw.StorageConnectionHandler}
+			storageDriver.Connect()
+
 			k.Spec.OAuthManager = &OAuthManager{
 				OsinServer: k.Gw.TykOsinNewServer(&osin.ServerConfig{},
 					&RedisOsinStorageInterface{
 						storageManager,
 						k.Gw.GlobalSessionManager,
-						&storage.RedisCluster{KeyPrefix: prefix, HashKeys: false, RedisController: k.Gw.RedisController},
+						storageDriver,
 						k.Spec.OrgID,
 						k.Gw,
 					}),
@@ -586,15 +596,16 @@ func (k *JWTMiddleware) processCentralisedJWT(r *http.Request, token *jwt.Token)
 		}
 
 		// Retrieve OAuth client data from storage and inject developer ID into the session object:
-		client, err := k.Spec.OAuthManager.OsinServer.Storage.GetClient(oauthClientID)
+		client, err := k.Spec.OAuthManager.Storage().GetClient(oauthClientID)
 		if err == nil {
 			userData := client.GetUserData()
 			if userData != nil {
 				data, ok := userData.(map[string]interface{})
 				if ok {
-					developerID, keyFound := data["tyk_developer_id"].(string)
-					if keyFound {
-						session.MetaData["tyk_developer_id"] = developerID
+					updateSession = session.TagsFromMetadata(data)
+
+					if err := k.ApplyPolicies(&session); err != nil {
+						return errors.New("failed to apply policies in session metadata: " + err.Error()), http.StatusInternalServerError
 					}
 				}
 			}
@@ -831,9 +842,12 @@ func assertSigningMethod(signingMethod string, token *jwt.Token) error {
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 			return fmt.Errorf("%v: %v and not HMAC signature", UnexpectedSigningMethod, token.Header["alg"])
 		}
+	// Supports both RSA + RSAPSS Signing.
 	case RSASign:
 		if _, ok := token.Method.(*jwt.SigningMethodRSA); !ok {
-			return fmt.Errorf("%v: %v and not RSA signature", UnexpectedSigningMethod, token.Header["alg"])
+			if _, ok := token.Method.(*jwt.SigningMethodRSAPSS); !ok {
+				return fmt.Errorf("%v: %v and not RSA or RSAPSS signature", UnexpectedSigningMethod, token.Header["alg"])
+			}
 		}
 	case ECDSASign:
 		if _, ok := token.Method.(*jwt.SigningMethodECDSA); !ok {

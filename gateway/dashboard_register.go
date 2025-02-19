@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/TykTechnologies/tyk/header"
@@ -30,6 +31,18 @@ type DashboardServiceSender interface {
 	NotifyDashboardOfEvent(interface{}) error
 }
 
+// Constants for heartBeatStopSentinel indicators.
+//
+// Go 1.17 adds atomic.Value.Swap which is great, but 1.19
+// adds atomic.Bool and other types. This is a go <1.13 cludge.
+const (
+	// HeartBeatStarted Zero value - the handlers started
+	HeartBeatStarted = 0
+
+	// HeartBeatStopped value - the handlers invoked shutdown
+	HeartBeatStopped = 1
+)
+
 type HTTPDashboardHandler struct {
 	RegistrationEndpoint    string
 	DeRegistrationEndpoint  string
@@ -38,19 +51,29 @@ type HTTPDashboardHandler struct {
 
 	Secret string
 
-	heartBeatStopSentinel bool
-	Gw                    *Gateway `json:"-"`
+	heartBeatStopSentinel int32
+
+	Gw *Gateway `json:"-"`
 }
 
 var dashClient *http.Client
 
 func (gw *Gateway) initialiseClient() *http.Client {
 	if dashClient == nil {
-		dashClient = &http.Client{
-			Timeout: 30 * time.Second,
+		conf := gw.GetConfig()
+		timeout := conf.DBAppConfOptions.ConnectionTimeout
+
+		// I don't think this is the appropriate place for this. I recommend we look at
+		// something like https://github.com/mcuadros/go-defaults to normalize all our defaults.
+		if timeout < 1 {
+			timeout = 30
 		}
 
-		if gw.GetConfig().HttpServerOptions.UseSSL {
+		dashClient = &http.Client{
+			Timeout: time.Duration(timeout) * time.Second,
+		}
+
+		if conf.HttpServerOptions.UseSSL {
 			// Setup HTTPS client
 			tlsConfig := &tls.Config{
 				InsecureSkipVerify: gw.GetConfig().HttpServerOptions.SSLInsecureSkipVerify,
@@ -143,7 +166,7 @@ func (h *HTTPDashboardHandler) NotifyDashboardOfEvent(event interface{}) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		err := fmt.Errorf("Unexpected status code while trying to notify dashboard of a key limit quota trigger.. Got %d", resp.StatusCode)
+		err := fmt.Errorf("unexpected status code while trying to notify dashboard of a key limit quota trigger.. Got %d", resp.StatusCode)
 		log.Error(err)
 		return err
 	}
@@ -213,13 +236,18 @@ func (h *HTTPDashboardHandler) Ping() error {
 		h.Gw.initialiseClient())
 }
 
+func (h *HTTPDashboardHandler) isHeartBeatStopped() bool {
+	return atomic.LoadInt32(&h.heartBeatStopSentinel) == HeartBeatStopped
+}
+
 func (h *HTTPDashboardHandler) StartBeating() error {
+	atomic.SwapInt32(&h.heartBeatStopSentinel, HeartBeatStarted)
 
 	req := h.newRequest(http.MethodGet, h.HeartBeatEndpoint)
 
 	client := h.Gw.initialiseClient()
 
-	for !h.heartBeatStopSentinel {
+	for !h.isHeartBeatStopped() {
 		if err := h.sendHeartBeat(req, client); err != nil {
 			dashLog.Warning(err)
 		}
@@ -227,12 +255,11 @@ func (h *HTTPDashboardHandler) StartBeating() error {
 	}
 
 	dashLog.Info("Stopped Heartbeat")
-	h.heartBeatStopSentinel = false
 	return nil
 }
 
 func (h *HTTPDashboardHandler) StopBeating() {
-	h.heartBeatStopSentinel = true
+	atomic.SwapInt32(&h.heartBeatStopSentinel, HeartBeatStopped)
 }
 
 func (h *HTTPDashboardHandler) newRequest(method, endpoint string) *http.Request {
@@ -292,11 +319,11 @@ func (h *HTTPDashboardHandler) DeRegister() error {
 	resp, err := c.Do(req)
 
 	if err != nil {
-		return fmt.Errorf("deregister request failed with error %v", err)
+		return fmt.Errorf("deregister request failed with error %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("deregister request failed with status %v", resp.StatusCode)
+		return fmt.Errorf("deregister request failed with status %d", resp.StatusCode)
 	}
 
 	val := NodeResponseOK{}
